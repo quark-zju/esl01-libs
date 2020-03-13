@@ -1,14 +1,11 @@
 [package]
-name = "vlqencoding"
+name = "esl01-vlqencoding"
 version = "0.1.0"
 edition = "2018"
-
-[dependencies]
+authors = ["Facebook Source Control Team <sourcecontrol-dev@fb.com>"]
+license = "GPL-2.0-only"
+description = "VLQ encoding (https://en.wikipedia.org/wiki/Variable-length_quantity)."
+repository = "https://github.com/facebookexperimental/eden"
 
 [dev-dependencies]
-minibench = { path = "../minibench" }
 quickcheck = "0.9"
-
-[[bench]]
-name = "bench"
-harness = false

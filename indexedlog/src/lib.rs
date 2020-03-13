@@ -30,6 +30,3 @@ pub mod utils;
 
 pub use errors::{Error, Result};
 pub use repair::{DefaultOpenOptions, Repair};
-
-#[cfg(test)]
-dev_logger::init!();

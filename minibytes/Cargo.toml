@@ -1,7 +1,11 @@
 [package]
-name = "minibytes"
+name = "esl01-minibytes"
 version = "0.1.0"
 edition = "2018"
+authors = ["Facebook Source Control Team <sourcecontrol-dev@fb.com>"]
+license = "GPL-2.0-only"
+description = "Shared reference-counted bytes with zero-copy slicing support."
+repository = "https://github.com/facebookexperimental/eden"
 
 [dependencies]
 memmap = "0.7"
