@@ -1,4 +1,4 @@
-name: Rust
+name: build
 
 on:
   push:
@@ -23,3 +23,5 @@ jobs:
       run: cargo test --target-dir target --manifest-path mincode/Cargo.toml --lib
     - name: Run minibytes tests
       run: cargo test --target-dir target --manifest-path minibytes/Cargo.toml --lib --
+    - name: Run vlqencoding tests
+      run: cargo test --target-dir target --manifest-path vlqencoding/Cargo.toml --lib --
