@@ -1,6 +1,6 @@
 [package]
 name = "esl01-dag"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2018"
 authors = ["Facebook Source Control Team <sourcecontrol-dev@fb.com>"]
 license = "GPL-2.0-only"
@@ -8,8 +8,8 @@ description = "An implementation of a DAG used for source control."
 repository = "https://github.com/facebookexperimental/eden"
 
 [dependencies]
-indexedlog = { package = "esl01-indexedlog", version = "0.1", path = "../indexedlog" }
-minibytes = { package = "esl01-minibytes", version = "0.1", path = "../minibytes" }
+indexedlog = { package = "esl01-indexedlog", version = "0.1.1", path = "../indexedlog" }
+minibytes = { package = "esl01-minibytes", version = "0.2", path = "../minibytes" }
 vlqencoding = { package = "esl01-vlqencoding", version = "0.1", path = "../vlqencoding" }
 
 anyhow = "1.0.20"

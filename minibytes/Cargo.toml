@@ -1,6 +1,6 @@
 [package]
 name = "esl01-minibytes"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2018"
 authors = ["Facebook Source Control Team <sourcecontrol-dev@fb.com>"]
 license = "GPL-2.0-only"
