@@ -1,0 +1,25 @@
+name: Rust
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: Run dag tests
+      run: cargo test --target-dir target --manifest-path dag/Cargo.toml --lib
+    - name: Run drawdag tests
+      run: cargo test --target-dir target --manifest-path drawdag/Cargo.toml --lib
+    - name: Run indexedlog tests
+      run: cargo test --target-dir target --manifest-path indexedlog/Cargo.toml --lib
+    - name: Run mincode tests
+      run: cargo test --target-dir target --manifest-path mincode/Cargo.toml --lib
+    - name: Run minibytes tests
+      run: cargo test --target-dir target --manifest-path minibytes/Cargo.toml --lib --
