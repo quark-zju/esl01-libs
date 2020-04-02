@@ -694,8 +694,7 @@ impl Log {
     pub(crate) fn finalize_indexes(&mut self) -> crate::Result<()> {
         let result: crate::Result<_> = (|| {
             let dir = self.dir.clone();
-            if let Some(ref dir) = dir.as_opt_path() {
-                let dir = dir.clone();
+            if let Some(dir) = dir.as_opt_path() {
                 if !self.mem_buf.is_empty() {
                     return Err(crate::Error::programming(
                         "sync() should be called before finalize_indexes()",
@@ -1648,14 +1647,39 @@ impl<'a> DoubleEndedIterator for LogRangeIter<'a> {
 
 impl Debug for Log {
     fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
+        let mut count = 0;
         let mut iter = self.iter();
+        let bytes_per_line = 16;
         loop {
             let offset = iter.next_offset;
-            write!(f, "Entry[{}]: ", offset)?;
+            count += 1;
             match iter.next() {
                 None => break,
-                Some(Ok(bytes)) => writeln!(f, "{{ bytes: {:?} }}", bytes)?,
-                Some(Err(err)) => writeln!(f, "{{ error: {:?} }}", err)?,
+                Some(Ok(bytes)) => {
+                    if count > 1 {
+                        write!(f, "\n")?;
+                    }
+                    write!(f, "# Entry {}:\n", count)?;
+                    for (i, chunk) in bytes.chunks(bytes_per_line).enumerate() {
+                        write!(f, "{:08x}:", offset as usize + i * bytes_per_line)?;
+                        for b in chunk {
+                            write!(f, " {:02x}", b)?;
+                        }
+                        for _ in chunk.len()..bytes_per_line {
+                            write!(f, "   ")?;
+                        }
+                        write!(f, "  ")?;
+                        for &b in chunk {
+                            let ch = match b {
+                                0x20..=0x7e => b as char, // printable
+                                _ => '.',
+                            };
+                            write!(f, "{}", ch)?;
+                        }
+                        write!(f, "\n")?;
+                    }
+                }
+                Some(Err(err)) => writeln!(f, "# Error: {:?}", err)?,
             }
         }
         Ok(())

@@ -20,13 +20,16 @@ use crate::Level;
 use anyhow::{bail, Result};
 use bitflags::bitflags;
 use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
+use minibytes::Bytes;
 use std::fmt::{self, Debug, Formatter};
 use std::io::Cursor;
 use vlqencoding::{VLQDecode, VLQDecodeAt, VLQEncode};
 
-/// [`Segment`] provides access to fields of a node in a [`IdDag`] graph.
-/// [`Segment`] reads directly from the byte slice, without a full parsing.
-pub(crate) struct Segment<'a>(pub(crate) &'a [u8]);
+/// [`Segment`] represents a range of [`Id`]s in an [`IdDag`] graph.
+/// It provides methods to access properties of the segments, including the range itself,
+/// parents, and level information.
+#[derive(Clone, Eq)]
+pub struct Segment(pub(crate) Bytes);
 
 // Serialization format for Segment:
 //
@@ -56,7 +59,7 @@ bitflags! {
     }
 }
 
-impl<'a> Segment<'a> {
+impl Segment {
     pub(crate) const OFFSET_FLAGS: usize = 0;
     pub(crate) const OFFSET_LEVEL: usize = Self::OFFSET_FLAGS + 1;
     pub(crate) const OFFSET_HIGH: usize = Self::OFFSET_LEVEL + 1;
@@ -109,7 +112,7 @@ impl<'a> Segment<'a> {
     }
 
     pub(crate) fn parents(&self) -> Result<Vec<Id>> {
-        let mut cur = Cursor::new(self.0);
+        let mut cur = Cursor::new(&self.0);
         cur.set_position(Self::OFFSET_DELTA as u64);
         let _: u64 = cur.read_vlq()?;
         let parent_count: usize = cur.read_vlq()?;
@@ -120,13 +123,13 @@ impl<'a> Segment<'a> {
         Ok(result)
     }
 
-    pub(crate) fn serialize(
+    pub(crate) fn new(
         flags: SegmentFlags,
         level: Level,
         low: Id,
         high: Id,
         parents: &[Id],
-    ) -> Vec<u8> {
+    ) -> Self {
         debug_assert!(high >= low);
         let mut buf = Vec::with_capacity(1 + 8 + (parents.len() + 2) * 4);
         buf.write_u8(flags.bits()).unwrap();
@@ -137,11 +140,17 @@ impl<'a> Segment<'a> {
         for parent in parents {
             buf.write_vlq(parent.0).unwrap();
         }
-        buf
+        Self(buf.into())
     }
 }
 
-impl<'a> Debug for Segment<'a> {
+impl PartialEq for Segment {
+    fn eq(&self, other: &Self) -> bool {
+        self.0[..] == other.0[..]
+    }
+}
+
+impl Debug for Segment {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         let span = self.span().unwrap();
         if self.has_root().unwrap() {
@@ -173,8 +182,7 @@ mod tests {
             let low = Id(low);
             let high = Id(high);
             let parents: Vec<Id> = parents.into_iter().map(Id).collect();
-            let buf = Segment::serialize(flags, level, low, high, &parents);
-            let node = Segment(&buf);
+            let node = Segment::new(flags, level, low, high, &parents);
             node.flags().unwrap() == flags
                 && node.level().unwrap() == level
                 && node.span().unwrap() == (low..=high).into()

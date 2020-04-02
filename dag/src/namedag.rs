@@ -13,6 +13,7 @@ use crate::id::Group;
 use crate::id::VertexName;
 use crate::iddag::IdDag;
 use crate::iddag::SyncableIdDag;
+use crate::iddagstore::IndexedLogStore;
 use crate::idmap::IdMap;
 use crate::idmap::IdMapLike;
 use crate::idmap::SyncableIdMap;
@@ -30,7 +31,7 @@ use std::sync::Arc;
 /// A high-level wrapper structure. Combination of [`IdMap`] and [`Dag`].
 /// Maintains consistency of dag and map internally.
 pub struct NameDag {
-    pub(crate) dag: IdDag,
+    pub(crate) dag: IdDag<IndexedLogStore>,
     pub(crate) map: IdMap,
 
     /// A read-only snapshot of the `IdMap` that will be shared in `NameSet`s.
@@ -47,14 +48,14 @@ impl NameDag {
         let path = path.as_ref();
         let opts = multi::OpenOptions::from_name_opts(vec![
             ("idmap", IdMap::log_open_options()),
-            ("iddag", IdDag::log_open_options()),
+            ("iddag", IndexedLogStore::log_open_options()),
         ]);
         let mut mlog = opts.open(path)?;
         let mut logs = mlog.detach_logs();
         let dag_log = logs.pop().unwrap();
         let map_log = logs.pop().unwrap();
         let map = IdMap::open_from_log(map_log)?;
-        let dag = IdDag::open_from_log(dag_log)?;
+        let dag = IdDag::open_from_store(IndexedLogStore::open_from_log(dag_log))?;
         let snapshot_map = Arc::new(map.try_clone()?);
         Ok(Self {
             dag,
@@ -416,7 +417,7 @@ impl NameDag {
 /// non-master commits.
 fn non_master_parent_names(
     map: &SyncableIdMap,
-    dag: &SyncableIdDag,
+    dag: &SyncableIdDag<IndexedLogStore>,
 ) -> Result<HashMap<VertexName, Vec<VertexName>>> {
     let parent_ids = dag.non_master_parent_ids()?;
     // Map id to name.
@@ -435,7 +436,10 @@ fn non_master_parent_names(
 }
 
 /// Re-assign ids and segments for non-master group.
-pub fn rebuild_non_master(map: &mut SyncableIdMap, dag: &mut SyncableIdDag) -> Result<()> {
+pub fn rebuild_non_master(
+    map: &mut SyncableIdMap,
+    dag: &mut SyncableIdDag<IndexedLogStore>,
+) -> Result<()> {
     // backup part of the named graph in memory.
     let parents = non_master_parent_names(map, dag)?;
     let mut heads = parents
@@ -471,7 +475,7 @@ pub fn rebuild_non_master(map: &mut SyncableIdMap, dag: &mut SyncableIdDag) -> R
 /// Build IdMap and Segments for the given heads.
 pub fn build<F>(
     map: &mut SyncableIdMap,
-    dag: &mut SyncableIdDag,
+    dag: &mut SyncableIdDag<IndexedLogStore>,
     parent_names_func: F,
     master_heads: &[VertexName],
     non_master_heads: &[VertexName],
@@ -517,12 +521,12 @@ where
 /// consistent with `smartset.abstractsmartset`. Ideally, `smartset` provides
 /// public commit hash interface, and there is no LowLevelAccess here.
 pub unsafe trait LowLevelAccess {
-    fn dag(&self) -> &IdDag;
+    fn dag(&self) -> &IdDag<IndexedLogStore>;
     fn map(&self) -> &IdMap;
 }
 
 unsafe impl LowLevelAccess for NameDag {
-    fn dag(&self) -> &IdDag {
+    fn dag(&self) -> &IdDag<IndexedLogStore> {
         &self.dag
     }
     fn map(&self) -> &IdMap {

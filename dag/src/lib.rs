@@ -13,11 +13,12 @@
 
 pub mod id;
 mod iddag;
+mod iddagstore;
 pub mod idmap;
 pub mod namedag;
 pub mod nameset;
 pub mod protocol;
-pub mod segment;
+mod segment;
 pub mod spanset;
 
 pub use id::{Group, Id, VertexName};
@@ -28,6 +29,7 @@ pub use nameset::NameSet;
 pub use spanset::SpanSet;
 
 pub type Level = u8;
+pub type InProcessIdDag = IdDag<iddagstore::InProcessStore>;
 
 #[cfg(test)]
 mod tests;
