@@ -17,6 +17,8 @@ jobs:
       run: cargo test --target-dir target --manifest-path dag/Cargo.toml --lib
     - name: Run drawdag tests
       run: cargo test --target-dir target --manifest-path drawdag/Cargo.toml --lib
+    - name: Run gitdag tests
+      run: cargo test --target-dir target --manifest-path gitdag/Cargo.toml --lib
     - name: Run indexedlog tests
       run: cargo test --target-dir target --manifest-path indexedlog/Cargo.toml --lib
     - name: Run mincode tests
