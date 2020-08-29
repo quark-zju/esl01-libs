@@ -5,12 +5,13 @@
  * GNU General Public License version 2.
  */
 
-use super::{NameIter, NameSet, NameSetQuery};
+use super::hints::Flags;
+use super::{Hints, NameIter, NameSet, NameSetQuery};
+use crate::fmt::write_debug;
+use crate::Result;
 use crate::VertexName;
-use anyhow::Result;
 use std::any::Any;
 use std::fmt;
-use std::iter::{Chain, Filter};
 
 /// Union of 2 sets.
 ///
@@ -18,24 +19,33 @@ use std::iter::{Chain, Filter};
 /// is iterated, with duplicated names skipped.
 pub struct UnionSet {
     sets: [NameSet; 2],
+    hints: Hints,
 }
-
-type Iter<F> = Chain<
-    Box<dyn NameIter<Item = Result<VertexName>>>,
-    Filter<Box<dyn NameIter<Item = Result<VertexName>>>, F>,
->;
-
-type RevIter<F> = Chain<
-    Filter<Box<dyn NameIter<Item = Result<VertexName>>>, F>,
-    Box<dyn NameIter<Item = Result<VertexName>>>,
->;
-
-impl<F: FnMut(&Result<VertexName>) -> bool + Send> NameIter for Iter<F> {}
-impl<F: FnMut(&Result<VertexName>) -> bool + Send> NameIter for RevIter<F> {}
 
 impl UnionSet {
     pub fn new(lhs: NameSet, rhs: NameSet) -> Self {
-        Self { sets: [lhs, rhs] }
+        let hints = if lhs.hints().is_id_map_compatible(rhs.hints())
+            && lhs.hints().is_dag_compatible(rhs.hints())
+        {
+            let hints = Hints::new_inherit_idmap_dag(lhs.hints());
+            if let (Some(id1), Some(id2)) = (lhs.hints().min_id(), rhs.hints().min_id()) {
+                hints.set_min_id(id1.min(id2));
+            }
+            if let (Some(id1), Some(id2)) = (lhs.hints().max_id(), rhs.hints().max_id()) {
+                hints.set_max_id(id1.max(id2));
+            }
+            hints.add_flags(lhs.hints().flags() & rhs.hints().flags() & Flags::ANCESTORS);
+            hints
+        } else {
+            Hints::default()
+        };
+        if lhs.hints().contains(Flags::FILTER) || rhs.hints().contains(Flags::FILTER) {
+            hints.add_flags(Flags::FILTER);
+        }
+        Self {
+            sets: [lhs, rhs],
+            hints,
+        }
     }
 }
 
@@ -43,19 +53,20 @@ impl NameSetQuery for UnionSet {
     fn iter(&self) -> Result<Box<dyn NameIter>> {
         debug_assert_eq!(self.sets.len(), 2);
         let set0 = self.sets[0].clone();
-        let iter: Iter<_> = self.sets[0]
-            .iter()?
-            .chain(self.sets[1].iter()?.filter(move |name| match name {
-                Ok(name) => set0.contains(name).ok() != Some(true),
-                _ => true,
-            }));
+        let iter =
+            self.sets[0]
+                .iter()?
+                .chain(self.sets[1].iter()?.filter(move |name| match name {
+                    Ok(name) => set0.contains(name).ok() != Some(true),
+                    _ => true,
+                }));
         Ok(Box::new(iter))
     }
 
     fn iter_rev(&self) -> Result<Box<dyn NameIter>> {
         debug_assert_eq!(self.sets.len(), 2);
         let set0 = self.sets[0].clone();
-        let iter: RevIter<_> = self.sets[1]
+        let iter = self.sets[1]
             .iter_rev()?
             .filter(move |name| match name {
                 Ok(name) => set0.contains(name).ok() != Some(true),
@@ -99,11 +110,18 @@ impl NameSetQuery for UnionSet {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn hints(&self) -> &Hints {
+        &self.hints
+    }
 }
 
 impl fmt::Debug for UnionSet {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "<or {:?} {:?}>", &self.sets[0], &self.sets[1])
+        write!(f, "<or")?;
+        write_debug(f, &self.sets[0])?;
+        write_debug(f, &self.sets[1])?;
+        write!(f, ">")
     }
 }
 
@@ -116,7 +134,7 @@ mod tests {
     fn union(a: &[u8], b: &[u8]) -> UnionSet {
         let a = NameSet::from_query(VecQuery::from_bytes(a));
         let b = NameSet::from_query(VecQuery::from_bytes(b));
-        UnionSet { sets: [a, b] }
+        UnionSet::new(a, b)
     }
 
     #[test]

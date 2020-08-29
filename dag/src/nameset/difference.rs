@@ -5,9 +5,11 @@
  * GNU General Public License version 2.
  */
 
-use super::{NameIter, NameSet, NameSetQuery};
+use super::hints::Flags;
+use super::{Hints, NameIter, NameSet, NameSetQuery};
+use crate::fmt::write_debug;
+use crate::Result;
 use crate::VertexName;
-use anyhow::Result;
 use std::any::Any;
 use std::fmt;
 
@@ -17,6 +19,7 @@ use std::fmt;
 pub struct DifferenceSet {
     lhs: NameSet,
     rhs: NameSet,
+    hints: Hints,
 }
 
 struct Iter {
@@ -24,11 +27,25 @@ struct Iter {
     rhs: NameSet,
 }
 
-impl NameIter for Iter {}
-
 impl DifferenceSet {
     pub fn new(lhs: NameSet, rhs: NameSet) -> Self {
-        Self { lhs, rhs }
+        let hints = Hints::new_inherit_idmap_dag(lhs.hints());
+        // Inherit flags, min/max Ids from lhs.
+        hints.add_flags(
+            lhs.hints().flags()
+                & (Flags::EMPTY
+                    | Flags::ID_DESC
+                    | Flags::ID_ASC
+                    | Flags::TOPO_DESC
+                    | Flags::FILTER),
+        );
+        if let Some(id) = lhs.hints().min_id() {
+            hints.set_min_id(id);
+        }
+        if let Some(id) = lhs.hints().max_id() {
+            hints.set_max_id(id);
+        }
+        Self { lhs, rhs, hints }
     }
 }
 
@@ -53,18 +70,21 @@ impl NameSetQuery for DifferenceSet {
         Ok(self.lhs.contains(name)? && !self.rhs.contains(name)?)
     }
 
-    fn is_topo_sorted(&self) -> bool {
-        self.lhs.is_topo_sorted()
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn hints(&self) -> &Hints {
+        &self.hints
     }
 }
 
 impl fmt::Debug for DifferenceSet {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "<difference {:?} {:?}>", &self.lhs, &self.rhs)
+        write!(f, "<diff")?;
+        write_debug(f, &self.lhs)?;
+        write_debug(f, &self.rhs)?;
+        write!(f, ">")
     }
 }
 
@@ -94,7 +114,7 @@ mod tests {
     fn difference(a: &[u8], b: &[u8]) -> DifferenceSet {
         let a = NameSet::from_query(VecQuery::from_bytes(a));
         let b = NameSet::from_query(VecQuery::from_bytes(b));
-        DifferenceSet { lhs: a, rhs: b }
+        DifferenceSet::new(a, b)
     }
 
     #[test]

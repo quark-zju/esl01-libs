@@ -9,6 +9,9 @@
 //!
 //! Defines types around [`Id`].
 
+use crate::errors::programming;
+use crate::spanset::Span;
+use crate::Result;
 pub use minibytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -41,6 +44,27 @@ impl VertexName {
         unsafe { String::from_utf8_unchecked(v) }
     }
 
+    /// Convert from hex.
+    ///
+    /// If `len(hex)` is an odd number, hex + '0' will be used.
+    pub fn from_hex(hex: &[u8]) -> Result<Self> {
+        let mut bytes = vec![0u8; (hex.len() + 1) / 2];
+        for (i, byte) in hex.iter().enumerate() {
+            let value = match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                b'A'..=b'F' => byte - b'A' + 10,
+                _ => return programming(format!("{:?} is not a hex character", *byte as char)),
+            };
+            if i & 1 == 0 {
+                bytes[i / 2] |= value << 4;
+            } else {
+                bytes[i / 2] |= value;
+            }
+        }
+        Ok(VertexName(Bytes::from(bytes)))
+    }
+
     pub fn copy_from(value: &[u8]) -> Self {
         Self(value.to_vec().into())
     }
@@ -59,7 +83,14 @@ impl fmt::Debug for VertexName {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.0.len() >= 2 {
             // Use hex format for long names (ex. binary commit hashes).
-            write!(f, "{}", self.to_hex())
+            let hex = self.to_hex();
+            // Truncate to specified width (ex. '{:#.12}').
+            if let Some(width) = f.precision() {
+                let truncated = hex.get(..width).unwrap_or(&hex);
+                f.write_str(truncated)
+            } else {
+                f.write_str(&hex)
+            }
         } else {
             // Do not use hex if it's a valid utf-8 name.
             match std::str::from_utf8(self.as_ref()) {
@@ -109,6 +140,14 @@ impl Group {
     /// The maximum [`Id`] in this group.
     pub const fn max_id(self) -> Id {
         Id(self.min_id().0 + ((1u64 << (64 - Self::BITS)) - 1))
+    }
+
+    /// A [`Span`] covering `min_id`..=`max_id`.
+    pub const fn span(self) -> Span {
+        Span {
+            low: self.min_id(),
+            high: self.max_id(),
+        }
     }
 }
 
@@ -163,7 +202,11 @@ impl fmt::Debug for Id {
 
 impl fmt::Display for Group {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
+        match *self {
+            Group::MASTER => write!(f, "Group Master"),
+            Group::NON_MASTER => write!(f, "Group Non-Master"),
+            _ => write!(f, "Group {}", self.0),
+        }
     }
 }
 
@@ -199,6 +242,29 @@ impl Iterator for IdIter {
             let result = self.current;
             self.current = self.current + 1;
             Some(result)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quickcheck::quickcheck;
+
+    #[test]
+    fn test_vertex_from_hex_odd() {
+        let vertex = VertexName::from_hex(b"a").unwrap();
+        let vertex2 = VertexName::from_hex(b"a0").unwrap();
+        assert_eq!(vertex, vertex2);
+        assert_eq!(vertex.to_hex(), "a0");
+    }
+
+    quickcheck! {
+        fn test_vertex_hex_roundtrip(slice: Vec<u8>) -> bool {
+            let vertex = VertexName::from(slice);
+            let hex = vertex.to_hex();
+            let vertex2 = VertexName::from_hex(hex.as_bytes()).unwrap();
+            vertex2 == vertex
         }
     }
 }

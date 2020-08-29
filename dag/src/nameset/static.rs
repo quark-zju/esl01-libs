@@ -5,42 +5,43 @@
  * GNU General Public License version 2.
  */
 
-use super::{NameIter, NameSetQuery};
+use super::hints::Flags;
+use super::{Hints, NameIter, NameSetQuery};
+use crate::Result;
 use crate::VertexName;
-use anyhow::Result;
 use indexmap::IndexSet;
 use std::any::Any;
 use std::fmt;
 
 /// A set backed by a concrete ordered set.
-pub struct StaticSet(pub(crate) IndexSet<VertexName>);
-
-type Iter =
-    std::iter::Map<indexmap::set::IntoIter<VertexName>, fn(VertexName) -> Result<VertexName>>;
-
-pub(crate) type IterRev = std::iter::Map<
-    std::iter::Rev<indexmap::set::IntoIter<VertexName>>,
-    fn(VertexName) -> Result<VertexName>,
->;
-
-impl NameIter for Iter {}
-impl NameIter for IterRev {}
+pub struct StaticSet(pub(crate) IndexSet<VertexName>, Hints);
 
 impl StaticSet {
     pub fn from_names(names: impl IntoIterator<Item = VertexName>) -> Self {
-        let names = names.into_iter().collect();
-        Self(names)
+        let names: IndexSet<VertexName> = names.into_iter().collect();
+        let hints = Hints::default();
+        if names.is_empty() {
+            hints.add_flags(Flags::EMPTY);
+        }
+        Self(names, hints)
+    }
+
+    pub fn empty() -> Self {
+        let names: IndexSet<VertexName> = Default::default();
+        let hints = Hints::default();
+        hints.add_flags(Flags::EMPTY);
+        Self(names, hints)
     }
 }
 
 impl NameSetQuery for StaticSet {
     fn iter(&self) -> Result<Box<dyn NameIter>> {
-        let iter: Iter = self.0.clone().into_iter().map(Ok);
+        let iter = self.0.clone().into_iter().map(Ok);
         Ok(Box::new(iter))
     }
 
     fn iter_rev(&self) -> Result<Box<dyn NameIter>> {
-        let iter: IterRev = self.0.clone().into_iter().rev().map(Ok);
+        let iter = self.0.clone().into_iter().rev().map(Ok);
         Ok(Box::new(iter))
     }
 
@@ -59,25 +60,26 @@ impl NameSetQuery for StaticSet {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn hints(&self) -> &Hints {
+        &self.1
+    }
 }
 
 impl fmt::Debug for StaticSet {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "<[")?;
-        let mut count = 0;
-        // Makes the "debug" string bounded so it won't be super long for large StaticSet.
-        for name in self.0.iter().take(3) {
-            if count > 0 {
-                write!(f, " ")?;
-            }
-            write!(f, "{:?}", &name)?;
-            count += 1;
+        if self.0.is_empty() {
+            return f.write_str("<empty>");
         }
-        let remaining = self.0.len() - count;
+        write!(f, "<static ")?;
+        // Only show 3 commits by default.
+        let limit = f.width().unwrap_or(3);
+        f.debug_list().entries(self.0.iter().take(limit)).finish()?;
+        let remaining = self.0.len().max(limit) - limit;
         if remaining > 0 {
-            write!(f, "] + {} more>", remaining)?;
+            write!(f, " + {} more>", remaining)?;
         } else {
-            write!(f, "]>")?;
+            write!(f, ">")?;
         }
         Ok(())
     }
@@ -111,13 +113,26 @@ mod tests {
     #[test]
     fn test_debug() {
         let set = static_set(b"");
-        assert_eq!(format!("{:?}", set), "<[]>");
+        assert_eq!(format!("{:?}", set), "<empty>");
 
         let set = static_set(b"\x11\x33\x22");
-        assert_eq!(format!("{:?}", set), "<[1111 3333 2222]>");
+        assert_eq!(format!("{:?}", set), "<static [1111, 3333, 2222]>");
 
         let set = static_set(b"\xaa\x00\xaa\xdd\xee\xdd\x11\x22");
-        assert_eq!(format!("{:?}", set), "<[aaaa 0000 dddd] + 3 more>");
+        assert_eq!(
+            format!("{:?}", &set),
+            "<static [aaaa, 0000, dddd] + 3 more>"
+        );
+        // {:#?} can be used to show commits in multi-line.
+        assert_eq!(
+            format!("{:#?}", &set),
+            "<static [\n    aaaa,\n    0000,\n    dddd,\n] + 3 more>"
+        );
+        // {:5.2} can be used to control how many commits to show, and their length.
+        assert_eq!(
+            format!("{:5.2?}", &set),
+            "<static [aa, 00, dd, ee, 11] + 1 more>"
+        );
     }
 
     quickcheck::quickcheck! {

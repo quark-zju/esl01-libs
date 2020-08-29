@@ -5,10 +5,14 @@
  * GNU General Public License version 2.
  */
 
-use super::{NameIter, NameSet, NameSetQuery};
+use super::hints::Flags;
+use super::{Hints, NameIter, NameSet, NameSetQuery};
+use crate::fmt::write_debug;
+use crate::Id;
+use crate::Result;
 use crate::VertexName;
-use anyhow::Result;
 use std::any::Any;
+use std::cmp::Ordering;
 use std::fmt;
 
 /// Intersection of 2 sets.
@@ -17,34 +21,143 @@ use std::fmt;
 pub struct IntersectionSet {
     lhs: NameSet,
     rhs: NameSet,
+    hints: Hints,
 }
 
 struct Iter {
     iter: Box<dyn NameIter>,
     rhs: NameSet,
+    ended: bool,
+
+    /// Optional fast path for stop.
+    stop_condition: Option<StopCondition>,
 }
 
-impl NameIter for Iter {}
+struct StopCondition {
+    order: Ordering,
+    id: Id,
+}
+
+impl StopCondition {
+    fn should_stop_with_id(&self, id: Id) -> bool {
+        id.cmp(&self.id) == self.order
+    }
+}
 
 impl IntersectionSet {
     pub fn new(lhs: NameSet, rhs: NameSet) -> Self {
-        Self { lhs, rhs }
+        // More efficient if `lhs` is smaller. Swap `lhs` and `rhs` if `lhs` is `FULL`.
+        let (lhs, rhs) = if lhs.hints().contains(Flags::FULL)
+            && !rhs.hints().contains(Flags::FULL)
+            && !rhs.hints().contains(Flags::FILTER)
+            && lhs.hints().is_dag_compatible(rhs.hints())
+        {
+            (rhs, lhs)
+        } else {
+            (lhs, rhs)
+        };
+
+        let hints = Hints::new_inherit_idmap_dag(lhs.hints());
+        hints.add_flags(
+            lhs.hints().flags()
+                & (Flags::EMPTY
+                    | Flags::ID_DESC
+                    | Flags::ID_ASC
+                    | Flags::TOPO_DESC
+                    | Flags::FILTER),
+        );
+        // Only keep the ANCESTORS flag if lhs and rhs use a compatible Dag.
+        if lhs.hints().is_dag_compatible(rhs.hints()) {
+            hints.add_flags(lhs.hints().flags() & rhs.hints().flags() & Flags::ANCESTORS);
+        }
+        let compatible = hints.is_id_map_compatible(rhs.hints());
+        match (lhs.hints().min_id(), rhs.hints().min_id(), compatible) {
+            (Some(id), None, _) | (Some(id), Some(_), false) | (None, Some(id), true) => {
+                hints.set_min_id(id);
+            }
+            (Some(id1), Some(id2), true) => {
+                hints.set_min_id(id1.max(id2));
+            }
+            (None, Some(_), false) | (None, None, _) => (),
+        }
+        match (lhs.hints().max_id(), rhs.hints().max_id(), compatible) {
+            (Some(id), None, _) | (Some(id), Some(_), false) | (None, Some(id), true) => {
+                hints.set_max_id(id);
+            }
+            (Some(id1), Some(id2), true) => {
+                hints.set_max_id(id1.min(id2));
+            }
+            (None, Some(_), false) | (None, None, _) => (),
+        }
+        Self { lhs, rhs, hints }
     }
 }
 
 impl NameSetQuery for IntersectionSet {
     fn iter(&self) -> Result<Box<dyn NameIter>> {
+        let stop_condition = if !self.lhs.hints().is_id_map_compatible(self.rhs.hints()) {
+            None
+        } else if self.lhs.hints().contains(Flags::ID_ASC) {
+            if let Some(id) = self.rhs.hints().max_id() {
+                Some(StopCondition {
+                    id,
+                    order: Ordering::Greater,
+                })
+            } else {
+                None
+            }
+        } else if self.lhs.hints().contains(Flags::ID_DESC) {
+            if let Some(id) = self.rhs.hints().min_id() {
+                Some(StopCondition {
+                    id,
+                    order: Ordering::Less,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let iter = Iter {
             iter: self.lhs.iter()?,
             rhs: self.rhs.clone(),
+            ended: false,
+            stop_condition,
         };
         Ok(Box::new(iter))
     }
 
     fn iter_rev(&self) -> Result<Box<dyn NameIter>> {
+        let stop_condition = if !self.lhs.hints().is_id_map_compatible(self.rhs.hints()) {
+            None
+        } else if self.lhs.hints().contains(Flags::ID_DESC) {
+            if let Some(id) = self.rhs.hints().max_id() {
+                Some(StopCondition {
+                    id,
+                    order: Ordering::Greater,
+                })
+            } else {
+                None
+            }
+        } else if self.lhs.hints().contains(Flags::ID_ASC) {
+            if let Some(id) = self.rhs.hints().min_id() {
+                Some(StopCondition {
+                    id,
+                    order: Ordering::Less,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let iter = Iter {
             iter: self.lhs.iter_rev()?,
             rhs: self.rhs.clone(),
+            ended: false,
+            stop_condition,
         };
         Ok(Box::new(iter))
     }
@@ -53,18 +166,21 @@ impl NameSetQuery for IntersectionSet {
         Ok(self.lhs.contains(name)? && self.rhs.contains(name)?)
     }
 
-    fn is_topo_sorted(&self) -> bool {
-        self.lhs.is_topo_sorted()
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn hints(&self) -> &Hints {
+        &self.hints
     }
 }
 
 impl fmt::Debug for IntersectionSet {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "<and {:?} {:?}>", &self.lhs, &self.rhs)
+        write!(f, "<and")?;
+        write_debug(f, &self.lhs)?;
+        write_debug(f, &self.rhs)?;
+        write!(f, ">")
     }
 }
 
@@ -72,12 +188,28 @@ impl Iterator for Iter {
     type Item = Result<VertexName>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.ended {
+            return None;
+        }
         loop {
             let result = NameIter::next(self.iter.as_mut());
             if let Some(Ok(ref name)) = result {
                 match self.rhs.contains(&name) {
                     Err(err) => break Some(Err(err)),
-                    Ok(false) => continue,
+                    Ok(false) => {
+                        // Check if we can stop iteration early using hints.
+                        if let Some(ref cond) = self.stop_condition {
+                            if let Some(id_convert) = self.rhs.id_convert() {
+                                if let Ok(Some(id)) = id_convert.vertex_id_optional(&name) {
+                                    if cond.should_stop_with_id(id) {
+                                        self.ended = true;
+                                        return None;
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     Ok(true) => (),
                 }
             }
@@ -87,15 +219,19 @@ impl Iterator for Iter {
 }
 
 #[cfg(test)]
+#[allow(clippy::redundant_clone)]
 mod tests {
+    use super::super::id_lazy::tests::lazy_set;
+    use super::super::id_lazy::tests::lazy_set_inherit;
     use super::super::tests::*;
     use super::*;
+    use crate::Id;
     use std::collections::HashSet;
 
     fn intersection(a: &[u8], b: &[u8]) -> IntersectionSet {
         let a = NameSet::from_query(VecQuery::from_bytes(a));
         let b = NameSet::from_query(VecQuery::from_bytes(b));
-        IntersectionSet { lhs: a, rhs: b }
+        IntersectionSet::new(a, b)
     }
 
     #[test]
@@ -112,6 +248,46 @@ mod tests {
             assert!(!set.contains(&to_name(b))?);
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_intersection_min_max_id_fast_path() {
+        // The min_ids are intentionally wrong to test the fast paths.
+        let a = lazy_set(&[0x70, 0x60, 0x50, 0x40, 0x30, 0x20]);
+        let b = lazy_set_inherit(&[0x70, 0x65, 0x50, 0x40, 0x35, 0x20], &a);
+        let a = NameSet::from_query(a);
+        let b = NameSet::from_query(b);
+        a.hints().add_flags(Flags::ID_DESC);
+        b.hints().set_min_id(Id(0x40));
+        b.hints().set_max_id(Id(0x50));
+
+        let set = IntersectionSet::new(a, b.clone());
+        // No "20" - filtered out by min id fast path.
+        assert_eq!(shorten_iter(set.iter()), ["70", "50", "40"]);
+        // No "70" - filtered out by max id fast path.
+        assert_eq!(shorten_iter(set.iter_rev()), ["20", "40", "50"]);
+
+        // Test the reversed sort order.
+        let a = lazy_set(&[0x20, 0x30, 0x40, 0x50, 0x60, 0x70]);
+        let b = lazy_set_inherit(&[0x70, 0x65, 0x50, 0x40, 0x35, 0x20], &a);
+        let a = NameSet::from_query(a);
+        let b = NameSet::from_query(b);
+        a.hints().add_flags(Flags::ID_ASC);
+        b.hints().set_min_id(Id(0x40));
+        b.hints().set_max_id(Id(0x50));
+        let set = IntersectionSet::new(a, b.clone());
+        // No "70".
+        assert_eq!(shorten_iter(set.iter()), ["20", "40", "50"]);
+        // No "20".
+        assert_eq!(shorten_iter(set.iter_rev()), ["70", "50", "40"]);
+
+        // If two sets have incompatible IdMap, fast paths are not used.
+        let a = NameSet::from_query(lazy_set(&[0x20, 0x30, 0x40, 0x50, 0x60, 0x70]));
+        a.hints().add_flags(Flags::ID_ASC);
+        let set = IntersectionSet::new(a, b.clone());
+        // Should contain "70" and "20".
+        assert_eq!(shorten_iter(set.iter()), ["20", "40", "50", "70"]);
+        assert_eq!(shorten_iter(set.iter_rev()), ["70", "50", "40", "20"]);
     }
 
     quickcheck::quickcheck! {

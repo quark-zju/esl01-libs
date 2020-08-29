@@ -5,10 +5,11 @@
  * GNU General Public License version 2.
  */
 
+use crate::errors::bug;
 use crate::id::{Group, Id};
 use crate::segment::{Segment, SegmentFlags};
 use crate::Level;
-use anyhow::{bail, ensure, Result};
+use crate::Result;
 use byteorder::{BigEndian, WriteBytesExt};
 use fs2::FileExt;
 use indexedlog::log;
@@ -18,7 +19,6 @@ use std::fs::{self, File};
 use std::io::Cursor;
 use std::iter;
 use std::path::{Path, PathBuf};
-use vlqencoding::VLQEncode;
 
 pub trait IdDagStore {
     /// Maximum level segment in the store
@@ -64,8 +64,21 @@ pub trait IdDagStore {
         level: Level,
     ) -> Result<Box<dyn Iterator<Item = Result<Segment>> + 'a>>;
 
+    /// Iterate through segments at the given level in ascending order.
+    fn iter_segments_ascending<'a>(
+        &'a self,
+        min_high_id: Id,
+        level: Level,
+    ) -> Result<Box<dyn Iterator<Item = Result<Segment>> + 'a + Send + Sync>>;
+
     /// Iterate through master flat segments that have the given parent.
     fn iter_master_flat_segments_with_parent<'a>(
+        &'a self,
+        parent: Id,
+    ) -> Result<Box<dyn Iterator<Item = Result<Segment>> + 'a>>;
+
+    /// Iterate through flat segments that have the given parent.
+    fn iter_flat_segments_with_parent<'a>(
         &'a self,
         parent: Id,
     ) -> Result<Box<dyn Iterator<Item = Result<Segment>> + 'a>>;
@@ -163,7 +176,7 @@ impl IdDagStore for IndexedLogStore {
                     let seg = Segment(self.log.slice_to_bytes(bytes?));
                     Ok(seg.high()? + 1)
                 } else {
-                    bail!("key {:?} should have some values", key);
+                    bug(format!("key {:?} should have values in next_free_id", key))
                 }
             }
         }
@@ -209,13 +222,36 @@ impl IdDagStore for IndexedLogStore {
         Ok(Box::new(iter))
     }
 
+    fn iter_segments_ascending<'a>(
+        &'a self,
+        min_high_id: Id,
+        level: Level,
+    ) -> Result<Box<dyn Iterator<Item = Result<Segment>> + 'a + Send + Sync>> {
+        let lower_bound = Self::serialize_head_level_lookup_key(min_high_id, level);
+        let upper_bound = Self::serialize_head_level_lookup_key(Id::MAX, level);
+        let iter = self
+            .log
+            .lookup_range(Self::INDEX_LEVEL_HEAD, &lower_bound[..]..=&upper_bound[..])?;
+        let iter = iter.flat_map(move |entry| match entry {
+            Ok((_key, values)) => values
+                .map(|value| {
+                    let value = value?;
+                    Ok(Segment(self.log.slice_to_bytes(value)))
+                })
+                .collect(),
+            Err(err) => vec![Err(err.into())],
+        });
+        Ok(Box::new(iter))
+    }
+
     fn iter_master_flat_segments_with_parent<'a>(
         &'a self,
         parent: Id,
     ) -> Result<Box<dyn Iterator<Item = Result<Segment>> + 'a>> {
-        let mut key = Vec::with_capacity(8);
-        key.write_vlq(parent.0)
-            .expect("write to Vec should not fail");
+        let mut key = Vec::with_capacity(9);
+        // child (segment low id) is in the "master" group.
+        key.write_u8(Group::MASTER.0 as u8).unwrap();
+        key.write_u64::<BigEndian>(parent.0).unwrap();
         let iter = self.log.lookup(Self::INDEX_PARENT, &key)?;
         let iter = iter.map(move |result| match result {
             Ok(bytes) => Ok(Segment(self.log.slice_to_bytes(bytes))),
@@ -224,16 +260,39 @@ impl IdDagStore for IndexedLogStore {
         Ok(Box::new(iter))
     }
 
+    fn iter_flat_segments_with_parent<'a>(
+        &'a self,
+        parent: Id,
+    ) -> Result<Box<dyn Iterator<Item = Result<Segment>> + 'a>> {
+        let get_iter = |group: Group| -> Result<_> {
+            let mut key = Vec::with_capacity(9);
+            key.write_u8(group.0 as u8).unwrap();
+            key.write_u64::<BigEndian>(parent.0).unwrap();
+            let iter = self.log.lookup(Self::INDEX_PARENT, &key)?;
+            let iter = iter.map(move |result| match result {
+                Ok(bytes) => Ok(Segment(self.log.slice_to_bytes(bytes))),
+                Err(err) => Err(err.into()),
+            });
+            Ok(iter)
+        };
+        let iter: Box<dyn Iterator<Item = Result<Segment>> + 'a> =
+            if parent.group() == Group::MASTER {
+                Box::new(get_iter(Group::MASTER)?.chain(get_iter(Group::NON_MASTER)?))
+            } else {
+                Box::new(get_iter(Group::NON_MASTER)?)
+            };
+        Ok(iter)
+    }
+
     /// Mark non-master ids as "removed".
     fn remove_non_master(&mut self) -> Result<()> {
         self.log.append(Self::MAGIC_CLEAR_NON_MASTER)?;
         // As an optimization, we could pass a max_level hint from iddag.
         // Doesn't seem necessary though.
         for level in 0..=self.max_level()? {
-            ensure!(
-                self.next_free_id(level, Group::NON_MASTER)? == Group::NON_MASTER.min_id(),
-                "bug: remove_non_master did not take effect"
-            );
+            if self.next_free_id(level, Group::NON_MASTER)? != Group::NON_MASTER.min_id() {
+                return bug("remove_non_master did not take effect");
+            }
         }
         Ok(())
     }
@@ -323,31 +382,41 @@ impl IndexedLogStore {
                     )]
                 }
             })
-            .index("parent", |data| {
-                // parent -> child for flat segments
+            .index("group-parent", |data| {
+                //  child-group parent -> child for flat segments
+                //  ^^^^^^^^^^^ ^^^^^^
+                //  u8          u64 BE
+                //
+                //  The "child-group" prefix is used for invalidating index when
+                //  non-master Ids get re-assigned.
+                if data.len() < Segment::OFFSET_DELTA && data == Self::MAGIC_CLEAR_NON_MASTER {
+                    // Invalidate child-group == 1 entries
+                    return vec![log::IndexOutput::RemovePrefix(Box::new([
+                        Group::NON_MASTER.0 as u8,
+                    ]))];
+                }
                 let seg = Segment(Bytes::copy_from_slice(data));
                 let mut result = Vec::new();
-                if seg.level().ok() == Some(0)
-                    && seg.high().map(|id| id.group()).ok() == Some(Group::MASTER)
-                {
+                if seg.level().ok() == Some(0) {
                     // This should never pass since MAGIC_CLEAR_NON_MASTER[0] != 0.
+                    // ([0] stores level: u8).
                     assert_ne!(
                         data,
                         Self::MAGIC_CLEAR_NON_MASTER,
                         "bug: MAGIC_CLEAR_NON_MASTER conflicts with data"
                     );
-                    if let Ok(parents) = seg.parents() {
+                    if let (Ok(parents), Ok(span)) = (seg.parents(), seg.span()) {
+                        let group = span.low.group();
+                        assert_eq!(
+                            span.low.group(),
+                            span.high.group(),
+                            "Cross-group segment is unexpected"
+                        );
                         for id in parents {
-                            let mut bytes = Vec::with_capacity(8);
-                            bytes.write_vlq(id.0).expect("write to Vec should not fail");
-                            // Attempt to use IndexOutput::Reference instead of
-                            // IndexOutput::Owned to reduce index size.
-                            match data.windows(bytes.len()).position(|w| w == &bytes[..]) {
-                                Some(pos) => result.push(log::IndexOutput::Reference(
-                                    pos as u64..(pos + bytes.len()) as u64,
-                                )),
-                                None => panic!("bug: {:?} should contain {:?}", &data, &bytes),
-                            }
+                            let mut bytes = Vec::with_capacity(9);
+                            bytes.write_u8(group.0 as u8).unwrap();
+                            bytes.write_u64::<BigEndian>(id.0).unwrap();
+                            result.push(log::IndexOutput::Owned(bytes.into()));
                         }
                     }
                 }
@@ -366,6 +435,15 @@ impl IndexedLogStore {
         Self { log, path }
     }
 
+    pub fn try_clone(&self) -> Result<IndexedLogStore> {
+        let log = self.log.try_clone()?;
+        let store = IndexedLogStore {
+            log,
+            path: self.path.clone(),
+        };
+        Ok(store)
+    }
+
     pub fn try_clone_without_dirty(&self) -> Result<IndexedLogStore> {
         let log = self.log.try_clone_without_dirty()?;
         let store = IndexedLogStore {
@@ -382,13 +460,14 @@ enum StoreId {
     NonMaster(usize),
 }
 
+#[derive(Clone)]
 pub struct InProcessStore {
     master_segments: Vec<Segment>,
     non_master_segments: Vec<Segment>,
     // level -> head -> serialized Segment
     level_head_index: Vec<BTreeMap<Id, StoreId>>,
-    // parent -> serialized Segment
-    parent_index: BTreeMap<Id, BTreeSet<StoreId>>,
+    // (child-group, parent) -> serialized Segment
+    parent_index: BTreeMap<(Group, Id), BTreeSet<StoreId>>,
 }
 
 impl IdDagStore for InProcessStore {
@@ -428,9 +507,13 @@ impl IdDagStore for InProcessStore {
                 StoreId::NonMaster(self.non_master_segments.len() - 1)
             }
         };
-        if level == 0 && high.group() == Group::MASTER {
+        if level == 0 {
+            let group = high.group();
             for parent in parents {
-                let children = self.parent_index.entry(parent).or_insert(BTreeSet::new());
+                let children = self
+                    .parent_index
+                    .entry((group, parent))
+                    .or_insert_with(BTreeSet::new);
                 children.insert(store_id);
             }
         }
@@ -439,13 +522,19 @@ impl IdDagStore for InProcessStore {
     }
 
     fn remove_non_master(&mut self) -> Result<()> {
-        // Note. The parent index should not contain any non master entries.
         for segment in self.non_master_segments.iter() {
             let level = segment.level()?;
             let head = segment.head()?;
             self.level_head_index
                 .get_mut(level as usize)
                 .map(|head_index| head_index.remove(&head));
+        }
+        let group = Group::NON_MASTER;
+        for (_key, children) in self
+            .parent_index
+            .range_mut((group, group.min_id())..=(group, group.max_id()))
+        {
+            children.clear();
         }
         self.non_master_segments = Vec::new();
         Ok(())
@@ -496,11 +585,27 @@ impl IdDagStore for InProcessStore {
         }
     }
 
+    fn iter_segments_ascending<'a>(
+        &'a self,
+        min_high_id: Id,
+        level: Level,
+    ) -> Result<Box<dyn Iterator<Item = Result<Segment>> + 'a + Send + Sync>> {
+        match self.get_head_index(level) {
+            None => Ok(Box::new(iter::empty())),
+            Some(head_index) => {
+                let iter = head_index
+                    .range(min_high_id..=Id::MAX)
+                    .map(move |(_, store_id)| Ok(self.get_segment(store_id)));
+                Ok(Box::new(iter))
+            }
+        }
+    }
+
     fn iter_master_flat_segments_with_parent<'a>(
         &'a self,
         parent: Id,
     ) -> Result<Box<dyn Iterator<Item = Result<Segment>> + 'a>> {
-        match self.parent_index.get(&parent) {
+        match self.parent_index.get(&(Group::MASTER, parent)) {
             None => Ok(Box::new(iter::empty())),
             Some(children) => {
                 let iter = children
@@ -509,6 +614,25 @@ impl IdDagStore for InProcessStore {
                 Ok(Box::new(iter))
             }
         }
+    }
+
+    fn iter_flat_segments_with_parent<'a>(
+        &'a self,
+        parent: Id,
+    ) -> Result<Box<dyn Iterator<Item = Result<Segment>> + 'a>> {
+        let get_iter = |group: Group| -> Result<Box<dyn Iterator<Item = Result<Segment>> + 'a>> {
+            match self.parent_index.get(&(group, parent)) {
+                None => Ok(Box::new(iter::empty())),
+                Some(children) => {
+                    let iter = children
+                        .iter()
+                        .map(move |store_id| Ok(self.get_segment(store_id)));
+                    Ok(Box::new(iter))
+                }
+            }
+        };
+        let iter = get_iter(Group::MASTER)?.chain(get_iter(Group::NON_MASTER)?);
+        Ok(Box::new(iter))
     }
 
     fn reload(&mut self) -> Result<()> {
@@ -561,9 +685,8 @@ mod tests {
     fn nid(id: u64) -> Id {
         Group::NON_MASTER.min_id() + id
     }
-    //  0---2--3--4--5--10--11--13--N0--N1--N2--N5--N6
-    //   \-1 \-6--8--9-/      \-12   \-N3--N4--/
-    //          \-7
+    //  0--1--2--3--4--5--10--11--12--13--N0--N1--N2--N5--N6
+    //         \-6-7-8--9-/-----------------\-N3--N4--/
     static LEVEL0_HEAD2: Lazy<Segment> =
         Lazy::new(|| Segment::new(SegmentFlags::HAS_ROOT, 0 as Level, Id(0), Id(2), &[]));
     static LEVEL0_HEAD5: Lazy<Segment> =
@@ -582,8 +705,15 @@ mod tests {
 
     static LEVEL0_HEADN2: Lazy<Segment> =
         Lazy::new(|| Segment::new(SegmentFlags::empty(), 0 as Level, nid(0), nid(2), &[Id(13)]));
-    static LEVEL0_HEADN4: Lazy<Segment> =
-        Lazy::new(|| Segment::new(SegmentFlags::empty(), 0 as Level, nid(3), nid(4), &[nid(0)]));
+    static LEVEL0_HEADN4: Lazy<Segment> = Lazy::new(|| {
+        Segment::new(
+            SegmentFlags::empty(),
+            0 as Level,
+            nid(3),
+            nid(4),
+            &[nid(0), Id(9)],
+        )
+    });
     static LEVEL0_HEADN6: Lazy<Segment> = Lazy::new(|| {
         Segment::new(
             SegmentFlags::empty(),
@@ -760,6 +890,46 @@ mod tests {
     }
 
     #[test]
+    fn test_in_process_store_iter_segments_ascending() {
+        let store = get_in_process_store();
+
+        let answer = store
+            .iter_segments_ascending(Id(12), 0)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let expected = segments_to_owned(&[
+            &LEVEL0_HEAD13,
+            &LEVEL0_HEADN2,
+            &LEVEL0_HEADN4,
+            &LEVEL0_HEADN6,
+        ]);
+        assert_eq!(answer, expected);
+
+        let answer = store
+            .iter_segments_ascending(Id(14), 0)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let expected = segments_to_owned(&[&LEVEL0_HEADN2, &LEVEL0_HEADN4, &LEVEL0_HEADN6]);
+        assert_eq!(answer, expected);
+
+        let mut answer = store.iter_segments_ascending(nid(7), 0).unwrap();
+        assert!(answer.next().is_none());
+
+        let answer = store
+            .iter_segments_ascending(nid(3), 1)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let expected = segments_to_owned(&[&LEVEL1_HEADN6]);
+        assert_eq!(answer, expected);
+
+        let mut answer = store.iter_segments_ascending(Id(5), 2).unwrap();
+        assert!(answer.next().is_none());
+    }
+
+    #[test]
     fn test_in_process_store_iter_master_flat_segments_with_parent() {
         let store = get_in_process_store();
 
@@ -779,6 +949,40 @@ mod tests {
 
         let mut answer = store.iter_master_flat_segments_with_parent(nid(2)).unwrap();
         assert!(answer.next().is_none());
+    }
+
+    #[test]
+    fn test_in_process_store_iter_flat_segments_with_parent() {
+        let store = get_in_process_store();
+
+        let lookup = |id: Id| -> Vec<_> {
+            let mut list = store
+                .iter_flat_segments_with_parent(id)
+                .unwrap()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            list.sort_unstable_by_key(|seg| seg.high().unwrap());
+            list
+        };
+
+        let answer = lookup(Id(2));
+        let expected = segments_to_owned(&[&LEVEL0_HEAD5, &LEVEL0_HEAD9]);
+        assert_eq!(answer, expected);
+
+        let answer = lookup(Id(13));
+        let expected = segments_to_owned(&[&LEVEL0_HEADN2]);
+        assert_eq!(answer, expected);
+
+        let answer = lookup(Id(4));
+        assert!(answer.is_empty());
+
+        let answer = lookup(nid(2));
+        let expected = segments_to_owned(&[&LEVEL0_HEADN6]);
+        assert_eq!(answer, expected);
+
+        let answer = lookup(Id(9));
+        let expected = segments_to_owned(&[&LEVEL0_HEAD13, &LEVEL0_HEADN4]);
+        assert_eq!(answer, expected);
     }
 
     #[test]
