@@ -9,4 +9,5 @@ pub mod errors;
 mod gitdag;
 
 pub use self::gitdag::GitDag;
+pub use dag;
 pub use git2;
