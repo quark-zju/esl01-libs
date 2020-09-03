@@ -11,6 +11,7 @@ Before the upstream publishes the crates officially, this repository forks and r
 The crates are published to `crates.io` with prefix `esl01-`:
 - `esl01-dag`
 - `esl01-drawdag`
+- `esl01-hgtime`
 - `esl01-indexedlog`
 - `esl01-mincode`
 - `esl01-minibytes`

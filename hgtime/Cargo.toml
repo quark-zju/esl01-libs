@@ -1,0 +1,12 @@
+[package]
+name = "esl01-hgtime"
+version = "0.1.0"
+edition = "2018"
+authors = ["Facebook Source Control Team <sourcecontrol-dev@fb.com>"]
+license = "GPL-2.0-only"
+description = "Parse time from strings."
+repository = "https://github.com/facebookexperimental/eden"
+
+[dependencies]
+chrono = "0.4"
+humantime = "1.3"
