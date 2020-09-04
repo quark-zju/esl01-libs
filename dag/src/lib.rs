@@ -6,18 +6,20 @@
  */
 
 #![allow(dead_code)]
+#![allow(clippy::iter_nth_zero)]
 
 //! # dag
 //!
 //! Building blocks for the commit graph used by source control.
 
+mod bsearch;
 mod default_impl;
 mod delegate;
 pub mod errors;
 mod fmt;
 pub mod id;
 mod iddag;
-mod iddagstore;
+pub mod iddagstore;
 pub mod idmap;
 pub mod namedag;
 pub mod nameset;

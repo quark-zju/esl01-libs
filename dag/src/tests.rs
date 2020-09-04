@@ -17,6 +17,9 @@ use crate::NameSet;
 use crate::Result;
 use crate::SpanSet;
 use tempfile::tempdir;
+use test_dag::TestDag;
+
+mod test_dag;
 
 #[cfg(test)]
 pub mod dummy_dag;
@@ -771,6 +774,40 @@ fn test_namedag_reassign_master() -> crate::Result<()> {
 }
 
 #[test]
+fn test_namedag_reassign_non_master() {
+    let mut t = TestDag::new();
+
+    // A: master; B, Z: non-master.
+    t.drawdag("A--B--Z", &["A"]);
+    // C, D, E: non-master.
+    t.drawdag("B--C--D--E", &[]);
+    // Prompt C to master. Triggers non-master reassignment.
+    t.drawdag("", &["C"]);
+
+    // Z still exists.
+    assert_eq!(
+        t.render_graph(),
+        r#"
+            Z  N2
+            │
+            │ E  N1
+            │ │
+            │ D  N0
+            │ │
+            │ C  2
+            ├─╯
+            B  1
+            │
+            A  0"#
+    );
+
+    // Z can round-trip in IdMap.
+    let z_id = t.dag.vertex_id("Z".into()).unwrap();
+    let z_vertex = t.dag.vertex_name(z_id).unwrap();
+    assert_eq!(format!("{:?}", z_vertex), "Z");
+}
+
+#[test]
 fn test_segment_ancestors_example1() {
     // DAG from segmented-changelog.pdf
     let ascii_dag = r#"
@@ -1236,38 +1273,26 @@ pub(crate) struct BuildSegmentResult {
 /// Take an ASCII DAG, assign segments from given heads.
 /// Return the ASCII DAG and the built NameDag.
 pub(crate) fn build_segments(text: &str, heads: &str, segment_size: usize) -> BuildSegmentResult {
-    let dir = tempdir().unwrap();
-    let mut name_dag = NameDag::open(dir.path().join("n")).unwrap();
-    name_dag.dag.set_new_segment_size(segment_size);
+    let mut dag = TestDag::new_with_segment_size(segment_size);
 
-    let parents_by_name = get_parents_func_from_ascii(text);
-
-    let ascii = heads
-        .split(' ')
-        .map(|head| {
-            let binary_head = VertexName::copy_from(head.as_bytes());
-
-            // Assign to non-master if the name starts with a lowercase character.
-            let (master, other) = if head.chars().nth(0).unwrap().is_lowercase() {
-                (vec![], vec![binary_head])
-            } else {
-                (vec![binary_head], vec![])
-            };
-
-            name_dag.add_heads(&parents_by_name, &master).unwrap();
-            name_dag.add_heads(&parents_by_name, &other).unwrap();
-            let iter = name_dag.all().unwrap().iter().unwrap();
-            iter.collect::<std::result::Result<Vec<_>, _>>()
-                .expect("name_dag iter() should work with pending changes");
-            name_dag.flush(&master).unwrap();
-            format!("{}\n{:?}", name_dag.map.replace(text), name_dag.dag)
-        })
-        .collect();
+    let mut ascii = Vec::new();
+    for head in heads.split(' ') {
+        // Assign to non-master if the name starts with a lowercase character.
+        let master = if head.chars().nth(0).unwrap().is_lowercase() {
+            vec![]
+        } else {
+            vec![head]
+        };
+        dag.drawdag_with_limited_heads(text, &master[..], Some(&[head]));
+        let annotated = dag.annotate_ascii(text);
+        let segments = dag.render_segments();
+        ascii.push(format!("{}\n{}", annotated, segments));
+    }
 
     BuildSegmentResult {
         ascii,
-        name_dag,
-        dir,
+        name_dag: dag.dag,
+        dir: dag.dir,
     }
 }
 

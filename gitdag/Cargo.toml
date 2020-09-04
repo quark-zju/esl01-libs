@@ -9,6 +9,6 @@ repository = "https://github.com/facebookexperimental/eden"
 
 [dependencies]
 anyhow = "1"
-dag = { package = "esl01-dag", version = "0.2", path = "../dag" }
+dag = { package = "esl01-dag", version = "0.2.1", path = "../dag" }
 git2 = "0.13"
 tracing = "0.1"

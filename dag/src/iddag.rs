@@ -12,7 +12,6 @@ use crate::idmap::AssignHeadOutcome;
 use crate::segment::{Segment, SegmentFlags};
 use crate::spanset::Span;
 use crate::spanset::SpanSet;
-use crate::spanset::SpanSetAsc;
 use crate::Error::Programming;
 use crate::Level;
 use crate::Result;
@@ -21,7 +20,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::{BTreeSet, BinaryHeap};
 use std::fmt::{self, Debug, Formatter};
-use std::fs::File;
 use std::path::Path;
 use tracing::{debug_span, field, trace};
 
@@ -49,44 +47,44 @@ pub struct IdDag<Store> {
 }
 
 /// Guard to make sure [`IdDag`] on-disk writes are race-free.
-pub struct SyncableIdDag<Store> {
-    dag: IdDag<Store>,
-    lock_file: File,
+///
+/// Aside from locking, another reason that `SyncableIdDag` exists is to make
+/// the on-disk segments lagging:
+/// - The in-memory high-level segments are not lagging, but might be
+///   fragmented because the last segment per level might not cover
+///   as many lower-level segments as it can.
+///   Some DAG algorithms (children_set, range_old, descendants_old)
+///   assume high-level segments are not lagging.
+/// - The on-disk data has lagging high-level segment. This is helpful
+///   because the Index backend is not good at (cheaply) deleting data
+///   with bytes freed.
+/// This adds some complexity:
+/// - IdDag -> SyncableIdMap needs to drop the last segment per high-level.
+///   This is done by `reload()` in `prepare_filesystem_sync()`.
+/// - SyncableIdDag -> IdDag needs to re-add the high-level segments.
+///   This is done by calling `build_all_high_level_segments()` at
+///   `SyncableIdDag::sync()`.
+///
+/// (Consider making `children_set` not rely on the property, and
+/// removing `*_old` to simplify things)
+pub struct SyncableIdDag<'a, Store: GetLock> {
+    dag: &'a mut IdDag<Store>,
+    lock: <Store as GetLock>::LockT,
 }
 
-static DEFAULT_SEG_SIZE: usize = 16;
+/// See benches/segment_sizes.rs (D16660078) for this choice.
+const DEFAULT_SEG_SIZE: usize = 16;
+
+/// Maximum meaningful level. 4 is chosen because it is good enough
+/// for an existing large repo (level 5 is not built because it
+/// cannot merge level 4 segments).
+const MAX_MEANINGFUL_LEVEL: Level = 4;
 
 impl IdDag<IndexedLogStore> {
     /// Open [`IdDag`] at the given directory. Create it on demand.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let store = IndexedLogStore::open(path)?;
         Self::open_from_store(store)
-    }
-
-    /// Return a [`SyncableIdDag`] instance that provides race-free
-    /// filesytem read and write access by taking an exclusive lock.
-    ///
-    /// The [`SyncableIdDag`] instance provides a `sync` method that
-    /// actually writes changes to disk.
-    ///
-    /// Block if another instance is taking the lock.
-    pub fn prepare_filesystem_sync(&self) -> Result<SyncableIdDag<IndexedLogStore>> {
-        let lock_file = self.store.get_lock()?;
-        // Clone. But drop in-memory data.
-        let mut store = self.store.try_clone_without_dirty()?;
-
-        // Read new entries from filesystem.
-        store.sync()?;
-        let max_level = store.max_level()?;
-
-        Ok(SyncableIdDag {
-            dag: IdDag {
-                store,
-                max_level,
-                new_seg_size: self.new_seg_size,
-            },
-            lock_file,
-        })
     }
 
     /// Set the maximum size of a new high-level segment.
@@ -97,6 +95,11 @@ impl IdDag<IndexedLogStore> {
     /// The default value is Usually good enough.
     pub fn set_new_segment_size(&mut self, size: usize) {
         self.new_seg_size = size.max(2);
+    }
+
+    /// Get the segment size used for building new high-level segments.
+    pub(crate) fn get_new_segment_size(&self) -> usize {
+        self.new_seg_size
     }
 
     /// Attempt to clone the `IdDag`.
@@ -131,7 +134,7 @@ impl<Store: IdDagStore> IdDag<Store> {
             max_level,
             new_seg_size: DEFAULT_SEG_SIZE, // see D16660078 for this default setting
         };
-        dag.build_all_high_level_segments(false)?;
+        dag.build_all_high_level_segments(false, max_level)?;
         Ok(dag)
     }
 }
@@ -210,6 +213,23 @@ impl<Store: IdDagStore> IdDag<Store> {
     }
 }
 
+// Obtains SyncableIdDag
+impl<Store: IdDagStore + GetLock> IdDag<Store> {
+    /// Return a [`SyncableIdDag`] instance that provides race-free
+    /// filesytem read and write access by taking an exclusive lock.
+    ///
+    /// The [`SyncableIdDag`] instance provides a `sync` method that
+    /// actually writes changes to disk.
+    ///
+    /// Block if another instance is taking the lock.
+    pub fn prepare_filesystem_sync(&mut self) -> Result<SyncableIdDag<Store>> {
+        let lock = self.store.get_lock()?;
+        // Read new entries from filesystem.
+        self.store.reload(&lock)?;
+        Ok(SyncableIdDag { dag: self, lock })
+    }
+}
+
 // Build segments.
 impl<Store: IdDagStore> IdDag<Store> {
     /// Make sure the [`IdDag`] contains the given id (and all ids smaller than
@@ -230,7 +250,7 @@ impl<Store: IdDagStore> IdDag<Store> {
         if self.next_free_id(0, high.group())? <= high {
             return bug("internal error: flat segments are not built as expected");
         }
-        count += self.build_all_high_level_segments(false)?;
+        count += self.build_all_high_level_segments(false, Level::MAX)?;
         Ok(count)
     }
 
@@ -241,7 +261,7 @@ impl<Store: IdDagStore> IdDag<Store> {
         outcome: &AssignHeadOutcome,
     ) -> Result<usize> {
         let mut count = self.build_flat_segments_from_assign_head_outcome(outcome)?;
-        count += self.build_all_high_level_segments(false)?;
+        count += self.build_all_high_level_segments(false, Level::MAX)?;
         Ok(count)
     }
 
@@ -514,9 +534,14 @@ impl<Store: IdDagStore> IdDag<Store> {
     /// reduce fragmentation.
     ///
     /// Return number of segments inserted.
-    fn build_all_high_level_segments(&mut self, drop_last: bool) -> Result<usize> {
+    fn build_all_high_level_segments(
+        &mut self,
+        drop_last: bool,
+        max_level: Level,
+    ) -> Result<usize> {
         let mut total = 0;
-        for level in 1.. {
+        let max_level = max_level.min(MAX_MEANINGFUL_LEVEL);
+        for level in 1..=max_level {
             let count = self.build_high_level_segments(level, drop_last)?;
             tracing::debug!("new lv{} segments: {}", level, count);
             if count == 0 {
@@ -525,17 +550,6 @@ impl<Store: IdDagStore> IdDag<Store> {
             total += count;
         }
         Ok(total)
-    }
-}
-
-// Reload.
-impl<Store: IdDagStore> IdDag<Store> {
-    /// Reload from the source of truth. Discard pending changes.
-    pub fn reload(&mut self) -> Result<()> {
-        self.store.reload()?;
-        self.max_level = self.store.max_level()?;
-        self.build_all_high_level_segments(false)?;
-        Ok(())
     }
 }
 
@@ -1335,7 +1349,7 @@ impl<Store: IdDagStore> IdDag<Store> {
             None => return Ok(SpanSet::empty()),
         };
         let max_root = roots.max().unwrap();
-        let mut result = SpanSetAsc::empty();
+        let mut result = SpanSet::empty();
 
         // For the master group, use linear scan for flat segments. This is
         // usually more efficient, because the master group usually only has 1
@@ -1369,9 +1383,9 @@ impl<Store: IdDagStore> IdDag<Store> {
             if low > master_max_id {
                 break;
             }
-            result.push_span(low..=span.high.min(master_max_id));
+            result.push_span_asc(Span::from(low..=span.high.min(master_max_id)));
         }
-        result = result.intersection(&SpanSetAsc::from_span_set(&ancestors));
+        result = result.intersection(&ancestors);
 
         // For the non-master group, only check flat segments covered by
         // `ancestors`.
@@ -1382,7 +1396,7 @@ impl<Store: IdDagStore> IdDag<Store> {
         // a few heads in the non-master group. It's a waste of time to iterate
         // through lots of invisible segments.
         let non_master_spans = ancestors.intersection(&Group::NON_MASTER.span().into());
-        // Visit in ascending order so SpanSetAsc::push_span works efficiently.
+        // Visit in ascending order.
         let mut span_iter = non_master_spans.as_spans().iter().rev().cloned();
         let mut next_optional_span = span_iter.next();
         while let Some(next_span) = next_optional_span {
@@ -1398,7 +1412,7 @@ impl<Store: IdDagStore> IdDag<Store> {
             if roots.contains(overlap_span.low) {
                 // Descendants includes 'overlap_span' since 'low' is in 'roots'.
                 // (no need to check 'result' - it does not include anything in 'overlap')
-                result.push_span(overlap_span);
+                result.push_span_asc(overlap_span);
             } else if next_span.low == seg_span.low {
                 let parents = seg.parents()?;
                 if !parents.is_empty()
@@ -1407,7 +1421,7 @@ impl<Store: IdDagStore> IdDag<Store> {
                         .any(|p| result.contains(p) || roots.contains(p))
                 {
                     // Descendants includes 'overlap_span' since parents are in roots or result.
-                    result.push_span(overlap_span);
+                    result.push_span_asc(overlap_span);
                 } else if overlap_span.low <= max_root && overlap_span.high >= min_root {
                     // If 'overlap_span' overlaps with roots, part of it should be in
                     // 'Descendants' result:
@@ -1420,7 +1434,7 @@ impl<Store: IdDagStore> IdDag<Store> {
                     let roots_intesection = roots.intersection(&overlap_span.into());
                     if let Some(id) = roots_intesection.min() {
                         overlap_span.low = id;
-                        result.push_span(overlap_span);
+                        result.push_span_asc(overlap_span);
                     }
                 }
             } else {
@@ -1435,7 +1449,7 @@ impl<Store: IdDagStore> IdDag<Store> {
                 // `next_span.low - 1` is the parent of `next_span.low`,
                 let p = next_span.low - 1;
                 if result.contains(p) || roots.contains(p) {
-                    result.push_span(overlap_span);
+                    result.push_span_asc(overlap_span);
                 }
             }
             // Update next_optional_span.
@@ -1443,7 +1457,7 @@ impl<Store: IdDagStore> IdDag<Store> {
                 .or_else(|| span_iter.next());
         }
 
-        Ok(result.into_span_set())
+        Ok(result)
     }
 }
 
@@ -1509,7 +1523,7 @@ pub enum FirstAncestorConstraint {
     KnownUniversally { heads: SpanSet },
 }
 
-impl<Store: IdDagStore> SyncableIdDag<Store> {
+impl<Store: IdDagStore + GetLock> SyncableIdDag<'_, Store> {
     /// Make sure the [`SyncableIdDag`] contains the given id (and all ids smaller
     /// than `high`) by building up segments on demand.
     ///
@@ -1522,7 +1536,7 @@ impl<Store: IdDagStore> SyncableIdDag<Store> {
     {
         let mut count = 0;
         count += self.dag.build_flat_segments(high, get_parents, 0)?;
-        count += self.dag.build_all_high_level_segments(true)?;
+        count += self.dag.build_all_high_level_segments(true, Level::MAX)?;
         Ok(count)
     }
 
@@ -1535,25 +1549,19 @@ impl<Store: IdDagStore> SyncableIdDag<Store> {
         let mut count = self
             .dag
             .build_flat_segments_from_assign_head_outcome(outcome)?;
-        count += self.dag.build_all_high_level_segments(true)?;
+        count += self.dag.build_all_high_level_segments(true, Level::MAX)?;
         Ok(count)
     }
 
     /// Write pending changes to disk. Release the exclusive lock.
     ///
     /// The newly written entries can be fetched by [`IdDag::reload`].
-    ///
-    /// To avoid races, [`IdDag`]s in the `reload_dags` list will be
-    /// reloaded while [`SyncableIdDag`] still holds the lock.
-    pub fn sync<'a, IterStore: 'a + IdDagStore>(
-        mut self,
-        reload_dags: impl IntoIterator<Item = &'a mut IdDag<IterStore>>,
-    ) -> Result<()> {
-        self.dag.store.sync()?;
-        for dag in reload_dags {
-            dag.reload()?;
-        }
-        let _lock_file = self.lock_file; // Make sure lock is not dropped until here.
+    pub fn sync(self) -> Result<()> {
+        self.dag.store.persist(&self.lock)?;
+        // Building high level segments happen in memory.
+        // No need to take a lock.
+        drop(self.lock);
+        self.dag.build_all_high_level_segments(false, Level::MAX)?;
         Ok(())
     }
 
@@ -1739,7 +1747,7 @@ mod tests {
             .build_segments_persistent(Id(1001), &get_parents)
             .unwrap();
 
-        syncable.sync(std::iter::once(&mut dag)).unwrap();
+        syncable.sync().unwrap();
 
         assert_eq!(dag.max_level, 3);
         assert_eq!(

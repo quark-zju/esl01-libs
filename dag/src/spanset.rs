@@ -9,12 +9,14 @@
 //!
 //! See [`SpanSet`] for the main structure.
 
+use crate::bsearch::BinarySearchBy;
 use crate::id::Id;
 use std::cmp::{
     Ordering::{self, Equal, Greater, Less},
     PartialOrd,
 };
 use std::collections::BinaryHeap;
+use std::collections::VecDeque;
 use std::fmt::{self, Debug};
 use std::ops::{Bound, RangeBounds, RangeInclusive};
 
@@ -28,7 +30,7 @@ pub struct Span {
 /// A set of integer spans.
 #[derive(Clone)]
 pub struct SpanSet {
-    spans: Vec<Span>,
+    spans: VecDeque<Span>,
 }
 
 impl PartialOrd for Span {
@@ -129,9 +131,7 @@ impl From<Id> for Span {
 
 impl<T: Into<Span>> From<T> for SpanSet {
     fn from(span: T) -> SpanSet {
-        SpanSet {
-            spans: vec![span.into()],
-        }
+        SpanSet::from_sorted_spans(std::iter::once(span.into()))
     }
 }
 
@@ -151,32 +151,39 @@ impl From<(Id, Id)> for SpanSet {
 
 impl SpanSet {
     /// Construct a [`SpanSet`] containing given spans.
-    /// Overlapped spans will be merged automatically.
+    /// Overlapped or adjacent spans will be merged automatically.
     pub fn from_spans<T: Into<Span>, I: IntoIterator<Item = T>>(spans: I) -> Self {
         let mut heap: BinaryHeap<Span> = spans.into_iter().map(|span| span.into()).collect();
-        let mut spans = Vec::with_capacity(heap.len().min(64));
+        let mut spans = VecDeque::with_capacity(heap.len().min(64));
         while let Some(span) = heap.pop() {
             push_with_union(&mut spans, span);
         }
         let result = SpanSet { spans };
         // `result` should be valid because the use of `push_with_union`.
-        debug_assert!(result.is_valid());
+        #[cfg(debug_assertions)]
+        result.validate();
         result
     }
 
     /// Construct a [`SpanSet`] containing given spans.
     /// The given spans must be already sorted (i.e. larger ids first), and do
     /// not have overlapped spans.
-    pub fn from_sorted_spans<T: Into<Span>, I: IntoIterator<Item = T>>(spans: I) -> Self {
-        let spans: Vec<Span> = spans.into_iter().map(Into::into).collect();
-        let result = SpanSet { spans };
-        assert!(result.is_valid());
+    /// Adjacent spans will be merged automatically.
+    pub fn from_sorted_spans<T: Into<Span>, I: IntoIterator<Item = T>>(span_iter: I) -> Self {
+        let mut spans = VecDeque::<Span>::new();
+        for span in span_iter {
+            let span = span.into();
+            push_with_union(&mut spans, span);
+        }
+        let result = Self { spans };
+        #[cfg(debug_assertions)]
+        result.validate();
         result
     }
 
     /// Construct an empty [`SpanSet`].
     pub fn empty() -> Self {
-        let spans = Vec::new();
+        let spans = VecDeque::new();
         SpanSet { spans }
     }
 
@@ -191,20 +198,21 @@ impl SpanSet {
         self.spans.is_empty()
     }
 
-    /// Check if the spans satisfies internal assumptions: sorted and not
-    /// overlapped.
-    fn is_valid(&self) -> bool {
-        self.spans
-            .iter()
-            .rev()
-            .cloned()
-            .fold((-1, true), |(last_high, is_sorted), span| {
-                (
-                    span.high.0 as i64,
-                    is_sorted && last_high < span.low.0 as i64,
-                )
-            })
-            .1
+    /// Validate the spans are in the expected order and there are no mergable
+    /// adjacent spans.
+    #[cfg(debug_assertions)]
+    fn validate(&self) {
+        for (i, span) in self.spans.iter().enumerate() {
+            assert!(span.low <= span.high);
+            if i > 0 {
+                assert!(
+                    span.high + 1 < self.spans[i - 1].low,
+                    "{:?} is not in DESC order or has mergable adjacent spans (around #{})",
+                    &self.spans,
+                    i
+                );
+            }
+        }
     }
 
     /// Count integers covered by this [`SpanSet`].
@@ -214,34 +222,25 @@ impl SpanSet {
 
     /// Tests if a given [`Id`] or [`Span`] is covered by this set.
     pub fn contains(&self, value: impl Into<Span>) -> bool {
-        let mut span = value.into();
-        loop {
-            let idx = match self
-                .spans
-                .binary_search_by(|probe| span.low.cmp(&probe.low))
-            {
-                Ok(idx) => idx,
-                Err(idx) => idx,
-            };
-            if let Some(existing_span) = self.spans.get(idx) {
-                debug_assert!(existing_span.low <= span.low);
-                if existing_span.high < span.low {
-                    return false;
-                } else if existing_span.high >= span.high {
-                    return true;
-                } else {
-                    span.low = existing_span.high + 1;
-                    debug_assert!(span.low <= span.high);
-                }
-            } else {
-                return false;
-            }
+        let span = value.into();
+        let idx = match self
+            .spans
+            .binary_search_by(|probe| span.low.cmp(&probe.low))
+        {
+            Ok(idx) => idx,
+            Err(idx) => idx,
+        };
+        if let Some(existing_span) = self.spans.get(idx) {
+            debug_assert!(existing_span.low <= span.low);
+            existing_span.high >= span.high
+        } else {
+            false
         }
     }
 
     /// Calculates the union of two sets.
     pub fn union(&self, rhs: &SpanSet) -> SpanSet {
-        let mut spans = Vec::with_capacity((self.spans.len() + rhs.spans.len()).min(32));
+        let mut spans = VecDeque::with_capacity((self.spans.len() + rhs.spans.len()).min(32));
         let mut iter_left = self.spans.iter().cloned();
         let mut iter_right = rhs.spans.iter().cloned();
         let mut next_left = iter_left.next();
@@ -269,7 +268,8 @@ impl SpanSet {
                 }
                 (None, None) => {
                     let result = SpanSet { spans };
-                    debug_assert!(result.is_valid());
+                    #[cfg(debug_assertions)]
+                    result.validate();
                     return result;
                 }
             }
@@ -278,7 +278,7 @@ impl SpanSet {
 
     /// Calculates the intersection of two sets.
     pub fn intersection(&self, rhs: &SpanSet) -> SpanSet {
-        let mut spans = Vec::with_capacity(self.spans.len().max(rhs.spans.len()).min(32));
+        let mut spans = VecDeque::with_capacity(self.spans.len().max(rhs.spans.len()).min(32));
         let mut iter_left = self.spans.iter().cloned();
         let mut iter_right = rhs.spans.iter().cloned();
         let mut next_left = iter_left.next();
@@ -309,7 +309,8 @@ impl SpanSet {
                 }
                 (_, None) | (None, _) => {
                     let result = SpanSet { spans };
-                    debug_assert!(result.is_valid());
+                    #[cfg(debug_assertions)]
+                    result.validate();
                     return result;
                 }
             }
@@ -318,7 +319,7 @@ impl SpanSet {
 
     /// Calculates spans that are included only by this set, not `rhs`.
     pub fn difference(&self, rhs: &SpanSet) -> SpanSet {
-        let mut spans = Vec::with_capacity(self.spans.len().max(rhs.spans.len()).min(32));
+        let mut spans = VecDeque::with_capacity(self.spans.len().max(rhs.spans.len()).min(32));
         let mut iter_left = self.spans.iter().cloned();
         let mut iter_right = rhs.spans.iter().cloned();
         let mut next_left = iter_left.next();
@@ -351,7 +352,8 @@ impl SpanSet {
                 }
                 (None, _) => {
                     let result = SpanSet { spans };
-                    debug_assert!(result.is_valid());
+                    #[cfg(debug_assertions)]
+                    result.validate();
                     return result;
                 }
             }
@@ -361,33 +363,59 @@ impl SpanSet {
     /// Get an iterator for integers in this [`SpanSet`].
     /// By default, the iteration is in descending order.
     pub fn iter(&self) -> SpanSetIter<&SpanSet> {
+        let len = self.spans.len();
+        let back = (
+            len as isize - 1,
+            if len == 0 {
+                0
+            } else {
+                let span = self.spans[len - 1];
+                span.high.0 - span.low.0
+            },
+        );
         SpanSetIter {
             span_set: self,
             front: (0, 0),
-            back: (
-                self.spans.len() as isize - 1,
-                self.spans
-                    .last()
-                    .map(|span| span.high.0 - span.low.0)
-                    .unwrap_or(0),
-            ),
+            back,
         }
     }
 
     /// Get the maximum id in this set.
     pub fn max(&self) -> Option<Id> {
-        self.spans.first().map(|span| span.high)
+        self.spans.get(0).map(|span| span.high)
     }
 
     /// Get the minimal id in this set.
     pub fn min(&self) -> Option<Id> {
-        self.spans.last().map(|span| span.low)
+        self.spans
+            .get(self.spans.len().max(1) - 1)
+            .map(|span| span.low)
     }
 
     /// Internal use only. Append a span, which must have lower boundaries
     /// than existing spans.
     pub(crate) fn push_span(&mut self, span: Span) {
         push_with_union(&mut self.spans, span);
+    }
+
+    /// Internal use only. Append a span, which must have high boundaries
+    /// than existing spans. In other words, spans passed to this function
+    /// should be in ascending order.
+    pub(crate) fn push_span_asc(&mut self, span: Span) {
+        if self.spans.is_empty() {
+            self.spans.push_back(span);
+        } else {
+            let mut last = &mut self.spans[0];
+            // | last |
+            //     | span |  | span |
+            debug_assert!(span.low >= last.low);
+            if last.high + 1 >= span.low {
+                // Update in-place.
+                last.high = span.high.max(last.high);
+            } else {
+                self.spans.push_front(span);
+            }
+        }
     }
 
     /// Internal use only. Append a [`SpanSet`], which must have lower
@@ -403,7 +431,7 @@ impl SpanSet {
     }
 
     /// Get a reference to the spans.
-    pub fn as_spans(&self) -> &Vec<Span> {
+    pub fn as_spans(&self) -> &VecDeque<Span> {
         &self.spans
     }
 
@@ -413,39 +441,70 @@ impl SpanSet {
     /// `min()`.
     pub fn push(&mut self, span: impl Into<Span>) {
         let span = span.into();
-        match self.spans.last_mut() {
-            None => self.spans.push(span),
-            Some(mut last) => {
-                if last.high >= span.high {
-                    if last.low <= span.high + 1 {
-                        // Union spans in-place.
-                        last.low = last.low.min(span.low);
-                    } else {
-                        self.spans.push(span)
-                    }
+        if self.spans.is_empty() {
+            self.spans.push_back(span)
+        } else {
+            let len = self.spans.len();
+            let mut last = &mut self.spans[len - 1];
+            if last.high >= span.high {
+                if last.low <= span.high + 1 {
+                    // Union spans in-place.
+                    last.low = last.low.min(span.low);
                 } else {
-                    // PERF: There is a better way to do this by bisecting
-                    // spans and insert in-place.  For now, this code path is
-                    // rarely used.
-                    *self = self.union(&SpanSet::from(span))
+                    self.spans.push_back(span)
                 }
+            } else {
+                // PERF: There is a better way to do this by bisecting
+                // spans and insert in-place.  For now, this code path is
+                // rarely used.
+                *self = self.union(&SpanSet::from(span))
             }
+        }
+    }
+
+    /// Intersection with a span. Return the min Id.
+    ///
+    /// This is not a general purpose API, but useful for internal logic
+    /// like DAG descendant calculation.
+    pub(crate) fn intersection_span_min(&self, rhs: Span) -> Option<Id> {
+        let i = match self
+            .spans
+            .binary_search_by(|probe| rhs.low.cmp(&probe.high))
+        {
+            Ok(idx) => idx,
+            Err(idx) => idx.max(1) - 1,
+        };
+        // Prefer small index so we get the span that might overlap:
+        // |----spans[1]----|      |----spans[0]----|
+        //                     |----rhs-----|
+        //                     (want spans[0], not spans[1])
+        if i < self.spans.len() {
+            let lhs = self.spans[i];
+            if lhs.low <= rhs.high && lhs.high >= rhs.low {
+                Some(lhs.low.max(rhs.low))
+            } else {
+                None
+            }
+        } else {
+            // Happens if the set is empty.
+            None
         }
     }
 }
 
-/// Push a span to `Vec<Span>`. Try to union them in-place.
-fn push_with_union(spans: &mut Vec<Span>, span: Span) {
-    match spans.last_mut() {
-        None => spans.push(span),
-        Some(mut last) => {
-            debug_assert!(last.high >= span.high);
-            if last.low <= span.high + 1 {
-                // Union spans in-place.
-                last.low = last.low.min(span.low);
-            } else {
-                spans.push(span)
-            }
+/// Push a span to `VecDeque<Span>`. Try to union them in-place.
+fn push_with_union(spans: &mut VecDeque<Span>, span: Span) {
+    if spans.is_empty() {
+        spans.push_back(span);
+    } else {
+        let len = spans.len();
+        let mut last = &mut spans[len - 1];
+        debug_assert!(last.high >= span.high);
+        if last.low <= span.high + 1 {
+            // Union spans in-place.
+            last.low = last.low.min(span.low);
+        } else {
+            spans.push_back(span)
         }
     }
 }
@@ -534,12 +593,15 @@ impl IntoIterator for SpanSet {
 
     /// Get an iterator for integers in this [`SpanSet`].
     fn into_iter(self) -> SpanSetIter<SpanSet> {
+        let len = self.spans.len();
         let back = (
-            self.spans.len() as isize - 1,
-            self.spans
-                .last()
-                .map(|span| span.high.0 - span.low.0)
-                .unwrap_or(0),
+            len as isize - 1,
+            if len == 0 {
+                0
+            } else {
+                let span = self.spans[len - 1];
+                span.high.0 - span.low.0
+            },
         );
         SpanSetIter {
             span_set: self,
@@ -555,78 +617,8 @@ impl AsRef<SpanSet> for SpanSet {
     }
 }
 
-/// `SpanSetAsc` is optimized for pushing spans in ascending order.
-/// (`SpanSet` is optimized for pushing spans in descending order).
-///
-/// It is only used by internal logic like the "range" DAG algorithm.
-///
-/// Internally, it just uses `SpanSet`, but replaces `id` with
-/// `Id::MAX - id`.
-#[derive(Clone)]
-pub(crate) struct SpanSetAsc(SpanSet);
-
-impl SpanSetAsc {
-    /// Return an empty `SpanSetAsc`.
-    pub fn empty() -> Self {
-        Self(SpanSet::empty())
-    }
-
-    /// Push a span. Spans must be pushed in ascending order.
-    pub(crate) fn push_span(&mut self, span: impl Into<Span>) {
-        self.0.push_span(span_rev(span.into()))
-    }
-
-    /// Test if an id exists in this span.
-    pub fn contains(&self, span: impl Into<Span>) -> bool {
-        self.0.contains(span_rev(span.into()))
-    }
-
-    /// Intersection with a span. Return the min Id.
-    ///
-    /// This is not a general purpose API, but useful for internal logic
-    /// like DAG descendant calculation.
-    pub(crate) fn intersection_span_min(&self, rhs: Span) -> Option<Id> {
-        let i = match self
-            .0
-            .spans
-            .binary_search_by(|&lhs| span_rev(lhs).high.cmp(&rhs.low))
-        {
-            Ok(i) => i,
-            Err(i) => i,
-        };
-        self.0.spans.get(i).and_then(|&lhs| {
-            let lhs = span_rev(lhs);
-            debug_assert!(lhs.high >= rhs.low);
-            if lhs.low <= rhs.high {
-                Some(lhs.low.max(rhs.low))
-            } else {
-                None
-            }
-        })
-    }
-
-    pub fn intersection(&self, rhs: &SpanSetAsc) -> SpanSetAsc {
-        Self(self.0.intersection(&rhs.0))
-    }
-
-    pub fn from_span_set(set: &SpanSet) -> SpanSetAsc {
-        let spans = set.as_spans().iter().cloned().rev().map(span_rev);
-        SpanSetAsc(SpanSet::from_sorted_spans(spans))
-    }
-
-    /// Convert back to a `SpanSet` optimized for descending order.
-    pub fn into_span_set(self) -> SpanSet {
-        let spans = self.0.as_spans().iter().cloned().rev().map(span_rev);
-        SpanSet::from_sorted_spans(spans)
-    }
-}
-
-/// Reverse a `Span`, for `SpanSetAsc` use-cases.
-fn span_rev(span: Span) -> Span {
-    Span::from((Id::MAX - span.high.0)..=(Id::MAX - span.low.0))
-}
-
 #[cfg(test)]
+#[allow(clippy::redundant_clone)]
 mod tests {
     use super::*;
 
@@ -671,6 +663,12 @@ mod tests {
     fn test_valid_spans() {
         SpanSet::empty();
         SpanSet::from_spans(vec![4..=4, 3..=3, 1..=2]);
+    }
+
+    #[test]
+    fn test_from_sorted_spans_merge() {
+        let s = SpanSet::from_sorted_spans(vec![4..=4, 3..=3, 1..=2]);
+        assert_eq!(format!("{:?}", s), "1..=4");
     }
 
     #[test]
@@ -779,24 +777,37 @@ mod tests {
         // |------------- a -------------------|
         // |--- spans1 ---|--- intersection ---|--- spans2 ---|
         //                |------------------- b -------------|
-        let intersected = intersect(a.spans.clone(), b.spans.clone());
-        let unioned = union(a.spans.clone(), b.spans.clone());
-        assert_eq!(
-            union(intersected.clone(), spans1.clone()),
-            union(a.spans.clone(), Vec::<Span>::new())
+        let intersected = intersect(
+            a.spans.iter().cloned().collect(),
+            b.spans.iter().cloned().collect(),
+        );
+        let unioned = union(
+            a.spans.iter().cloned().collect(),
+            b.spans.iter().cloned().collect(),
         );
         assert_eq!(
-            union(intersected.clone(), spans2.clone()),
-            union(b.spans.clone(), Vec::<Span>::new())
+            union(intersected.clone(), spans1.iter().cloned().collect()),
+            union(a.spans.iter().cloned().collect(), Vec::<Span>::new())
         );
         assert_eq!(
-            union(spans1.clone(), union(intersected.clone(), spans2.clone())),
+            union(intersected.clone(), spans2.iter().cloned().collect()),
+            union(b.spans.iter().cloned().collect(), Vec::<Span>::new())
+        );
+        assert_eq!(
+            union(
+                spans1.iter().cloned().collect(),
+                union(intersected.clone(), spans2.iter().cloned().collect())
+            ),
             unioned.clone(),
         );
 
-        assert!(intersect(spans1.clone(), spans2.clone()).is_empty());
-        assert!(intersect(spans1.clone(), intersected.clone()).is_empty());
-        assert!(intersect(spans2.clone(), intersected.clone()).is_empty());
+        assert!(intersect(
+            spans1.iter().cloned().collect(),
+            spans2.iter().cloned().collect()
+        )
+        .is_empty());
+        assert!(intersect(spans1.iter().cloned().collect(), intersected.clone()).is_empty());
+        assert!(intersect(spans2.iter().cloned().collect(), intersected.clone()).is_empty());
 
         spans1.into_iter().map(|span| span.into()).collect()
     }
@@ -886,26 +897,8 @@ mod tests {
     }
 
     #[test]
-    fn test_spanset_asc() {
-        let mut set = SpanSetAsc::empty();
-        assert!(!set.contains(3));
-
-        set.push_span(1..=10);
-        assert!(set.contains(3));
-
-        set.push_span(11..=20);
-        assert!(set.contains(10));
-        assert!(set.contains(11));
-        assert!(set.contains(20));
-        assert!(!set.contains(21));
-        assert_eq!(format!("{:?}", set.clone().into_span_set()), "1..=20");
-
-        set.push_span(30..=40);
-        assert_eq!(
-            format!("{:?}", set.clone().into_span_set()),
-            "1..=20 30..=40"
-        );
-
+    fn test_intersection_span_min() {
+        let set = SpanSet::from_spans(vec![1..=10, 11..=20, 30..=40]);
         assert_eq!(set.intersection_span_min((15..=45).into()), Some(Id(15)));
         assert_eq!(set.intersection_span_min((20..=32).into()), Some(Id(20)));
         assert_eq!(set.intersection_span_min((21..=29).into()), None);
