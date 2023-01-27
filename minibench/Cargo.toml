@@ -1,0 +1,11 @@
+[package]
+name = "esl01-minibench"
+version = "0.3.0"
+edition = "2021"
+authors = ["Facebook Source Control Team <sourcecontrol-dev@fb.com>"]
+license = "MIT"
+description = "Minimal benchmark library."
+repository = "https://github.com/facebook/sapling"
+
+[lib]
+name = "minibench"
