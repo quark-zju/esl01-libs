@@ -1,0 +1,16 @@
+[package]
+name = "esl01-dev-logger"
+version = "0.3.0"
+edition = "2021"
+authors = ["Facebook Source Control Team <sourcecontrol-dev@fb.com>"]
+license = "MIT"
+description = "Configure tracing logs in dev environment (ex. tests)."
+repository = "https://github.com/facebook/sapling"
+
+[lib]
+name = "dev_logger"
+
+[dependencies]
+ctor = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
