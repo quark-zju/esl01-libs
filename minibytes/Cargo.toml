@@ -1,15 +1,24 @@
 [package]
 name = "esl01-minibytes"
-version = "0.2.0"
-edition = "2018"
+version = "0.3.0"
+edition = "2021"
 authors = ["Facebook Source Control Team <sourcecontrol-dev@fb.com>"]
-license = "GPL-2.0-only"
+license = "MIT"
 description = "Shared reference-counted bytes with zero-copy slicing support."
-repository = "https://github.com/facebookexperimental/eden"
+repository = "https://github.com/facebook/sapling"
+
+[lib]
+name = "minibytes"
 
 [dependencies]
-memmap = "0.7"
-serde = "1"
+bytes = { version = "1.1", features = ["serde"], optional = true }
+memmap = { version = "0.7", optional = true }
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-quickcheck = "0.9"
+quickcheck = "1"
+
+[features]
+default = ["frombytes", "frommmap"]
+frombytes = ["bytes"]
+frommmap = ["memmap"]

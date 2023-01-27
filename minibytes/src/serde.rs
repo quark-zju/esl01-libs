@@ -1,13 +1,19 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
-use crate::Bytes;
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
+
+use serde::de;
+use serde::Deserialize;
+use serde::Deserializer;
+use serde::Serialize;
+use serde::Serializer;
+
+use crate::Bytes;
 
 impl Serialize for Bytes {
     #[inline]
@@ -31,6 +37,14 @@ impl<'de> de::Visitor<'de> for BytesVisitor {
 
     fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<Self::Value, E> {
         Ok(Bytes::copy_from_slice(v.as_bytes()))
+    }
+
+    fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+        Ok(Bytes::from(v))
+    }
+
+    fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E> {
+        Ok(Bytes::copy_from_slice(v))
     }
 }
 

@@ -1,14 +1,23 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 //! Implement common traits for [`Bytes`] and [`Text`].
 
-use crate::{Bytes, BytesOwner, Text, TextOwner};
-use std::{borrow, cmp, fmt, hash, ops};
+use std::ascii::escape_default;
+use std::borrow;
+use std::cmp;
+use std::fmt;
+use std::hash;
+use std::ops;
+
+use crate::Bytes;
+use crate::BytesOwner;
+use crate::Text;
+use crate::TextOwner;
 
 impl<T: BytesOwner> From<T> for Bytes {
     fn from(value: T) -> Self {
@@ -83,7 +92,13 @@ impl Ord for Bytes {
 
 impl fmt::Debug for Bytes {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Debug::fmt(self.as_slice(), f)
+        // Use `[u8]::escape_ascii` when inherent_ascii_escape is stabilized.
+        f.write_str("b\"")?;
+        for &byte in self.as_slice() {
+            fmt::Display::fmt(&escape_default(byte), f)?;
+        }
+        f.write_str("\"")?;
+        Ok(())
     }
 }
 
@@ -155,5 +170,11 @@ impl Ord for Text {
 impl fmt::Debug for Text {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(self.as_slice(), f)
+    }
+}
+
+impl fmt::Display for Text {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Display::fmt(self.as_slice(), f)
     }
 }

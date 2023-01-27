@@ -1,18 +1,21 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 //! Implement [`BytesOwner`] and [`TextOwner`] for common types.
 
-use crate::{BytesOwner, TextOwner};
-use memmap::Mmap;
+use crate::BytesOwner;
+use crate::TextOwner;
 
 impl BytesOwner for Vec<u8> {}
 impl BytesOwner for Box<[u8]> {}
 impl BytesOwner for String {}
-impl BytesOwner for Mmap {}
+#[cfg(feature = "frommmap")]
+impl BytesOwner for memmap::Mmap {}
+#[cfg(feature = "frombytes")]
+impl BytesOwner for bytes::Bytes {}
 
 impl TextOwner for String {}

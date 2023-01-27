@@ -1,11 +1,13 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
-use std::ops::{Range, RangeBounds};
+use std::any::Any;
+use std::ops::Range;
+use std::ops::RangeBounds;
 use std::sync::Arc;
 
 pub type Bytes = AbstractBytes<[u8]>;
@@ -17,13 +19,19 @@ pub struct AbstractBytes<T: ?Sized> {
     pub(crate) len: usize,
 
     // Actual owner of the bytes. None for static buffers.
-    owner: Option<Arc<dyn AbstractOwner<T>>>,
+    pub(crate) owner: Option<Arc<dyn AbstractOwner<T>>>,
 }
 
 /// The actual storage owning the bytes.
-pub trait AbstractOwner<T: ?Sized>: AsRef<T> + Send + Sync + 'static {}
+pub trait AbstractOwner<T: ?Sized>: AsRef<T> + Send + Sync + 'static {
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
 
-impl<T: BytesOwner> AbstractOwner<[u8]> for T {}
+impl<T: BytesOwner> AbstractOwner<[u8]> for T {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
 
 // AbstractOwner<T> is Send + Sync and AbstractBytes<T> is immutable.
 unsafe impl<T: ?Sized> Send for AbstractBytes<T> {}
@@ -118,17 +126,6 @@ where
         }
     }
 
-    /// Creates `Bytes` from a static slice.
-    #[inline]
-    pub fn from_static(value: &'static T) -> Self {
-        let slice: &[u8] = value.as_bytes();
-        Self {
-            ptr: slice.as_ptr(),
-            len: slice.len(),
-            owner: None,
-        }
-    }
-
     /// Creates `Bytes` from a [`BytesOwner`] (for example, `Vec<u8>`).
     pub fn from_owner(value: impl AbstractOwner<T>) -> Self {
         let slice: &T = value.as_ref();
@@ -149,12 +146,51 @@ where
     pub(crate) fn as_bytes(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
+
+    /// Attempt to downcast to an exclusive mut reference.
+    ///
+    /// Returns None if the type mismatches, or the internal reference count is
+    /// not 0.
+    pub fn downcast_mut<A: Any>(&mut self) -> Option<&mut A> {
+        let arc_owner = match self.owner.as_mut() {
+            None => return None,
+            Some(owner) => owner,
+        };
+        let owner = match Arc::get_mut(arc_owner) {
+            None => return None,
+            Some(owner) => owner,
+        };
+        let any = owner.as_any_mut();
+        any.downcast_mut()
+    }
 }
 
 impl Bytes {
     #[inline]
     pub(crate) fn as_slice(&self) -> &[u8] {
         self.as_bytes()
+    }
+
+    /// Creates `Bytes` from a static slice.
+    pub const fn from_static(slice: &'static [u8]) -> Self {
+        Self {
+            ptr: slice.as_ptr(),
+            len: slice.len(),
+            owner: None,
+        }
+    }
+
+    /// Convert to `Vec<u8>`, in a zero-copy way if possible.
+    pub fn into_vec(mut self) -> Vec<u8> {
+        let len = self.len();
+        match self.downcast_mut::<Vec<u8>>() {
+            Some(ref mut owner) if owner.len() == len => {
+                let mut result: Vec<u8> = Vec::new();
+                std::mem::swap(&mut result, owner);
+                result
+            }
+            Some(_) | None => self.as_slice().to_vec(),
+        }
     }
 }
 

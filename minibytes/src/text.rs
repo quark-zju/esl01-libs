@@ -1,18 +1,35 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
-use super::bytes::{AbstractBytes, AbstractOwner, SliceLike};
+use std::any::Any;
+
+use super::bytes::AbstractBytes;
+use super::bytes::AbstractOwner;
+use super::bytes::SliceLike;
 
 pub type Text = AbstractBytes<str>;
 pub trait TextOwner: AsRef<str> + Send + Sync + 'static {}
 
-impl<T: TextOwner> AbstractOwner<str> for T {}
+impl<T: TextOwner> AbstractOwner<str> for T {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
 
 impl Text {
+    /// Creates `Text` from a static str.
+    pub const fn from_static(slice: &'static str) -> Self {
+        Self {
+            ptr: slice.as_ptr(),
+            len: slice.len(),
+            owner: None,
+        }
+    }
+
     #[inline]
     pub(crate) fn as_slice(&self) -> &str {
         let bytes = self.as_bytes();
