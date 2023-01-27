@@ -1,0 +1,14 @@
+[package]
+name = "esl01-nonblocking"
+version = "0.3.0"
+edition = "2021"
+authors = ["Facebook Source Control Team <sourcecontrol-dev@fb.com>"]
+license = "MIT"
+description = "Call non-blocking async Rust from non-async Rust."
+repository = "https://github.com/facebook/sapling"
+
+[lib]
+name = "nonblocking"
+
+[dev-dependencies]
+futures = { version = "0.3" }
