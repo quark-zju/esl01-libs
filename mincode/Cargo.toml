@@ -1,18 +1,20 @@
 [package]
 name = "esl01-mincode"
-version = "0.0.1"
+version = "0.3.0"
 authors = ["David Tolnay <dtolnay@gmail.com>", "Facebook Source Control Team <sourcecontrol-dev@fb.com>"]
-edition = "2018"
-license = "GPL-2.0-only"
-include = ["Cargo.toml", "src/**/*.rs"]
+edition = "2021"
 description = "Bincode-like serialization with VLQ encoded integers."
-repository = "https://github.com/facebookexperimental/eden"
+license = "MIT"
+include = ["Cargo.toml", "src/**/*.rs"]
+repository = "https://github.com/facebook/sapling"
+
+[lib]
+name = "mincode"
 
 [dependencies]
-byteorder = "1.0"
-serde = "1.0"
-vlqencoding = { package = "esl01-vlqencoding", version = "0.1", path = "../vlqencoding" }
+byteorder = "1"
+serde = { version = "1", features = ["derive"] }
+vlqencoding = { version = "0.3", package = "esl01-vlqencoding", path = "../vlqencoding" }
 
 [dev-dependencies]
-quickcheck = "0.9"
-serde = { version = "1.0", features = ["derive"] }
+quickcheck = "1"

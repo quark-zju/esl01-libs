@@ -1,8 +1,8 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 mod de;
@@ -12,12 +12,15 @@ mod ser;
 #[cfg(test)]
 mod tests;
 
-use self::de::Deserializer;
-use self::ser::Serializer;
-use serde::{Deserialize, Serialize};
 use std::io;
 
-pub use self::error::{Error, Result};
+use serde::Deserialize;
+use serde::Serialize;
+
+use self::de::Deserializer;
+pub use self::error::Error;
+pub use self::error::Result;
+use self::ser::Serializer;
 
 pub fn serialize<T>(value: &T) -> Result<Vec<u8>>
 where
