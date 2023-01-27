@@ -1,25 +1,40 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 //! Rotation support for a set of [`Log`]s.
 
-use crate::errors::{IoResultExt, ResultExt};
-use crate::lock::ScopedDirLock;
-use crate::log::{self, FlushFilterContext, FlushFilterFunc, FlushFilterOutput, IndexDef, Log};
-use crate::repair::OpenOptionsRepair;
-use crate::utils;
-use minibytes::Bytes;
-use once_cell::sync::OnceCell;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-use tracing::{debug_span, trace};
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::SeqCst;
+
+use minibytes::Bytes;
+use once_cell::sync::OnceCell;
+use tracing::debug;
+use tracing::debug_span;
+use tracing::trace;
+
+use crate::errors::IoResultExt;
+use crate::errors::ResultExt;
+use crate::lock::ScopedDirLock;
+use crate::lock::READER_LOCK_OPTS;
+use crate::log;
+use crate::log::FlushFilterContext;
+use crate::log::FlushFilterFunc;
+use crate::log::FlushFilterOutput;
+use crate::log::IndexDef;
+use crate::log::Log;
+use crate::repair::OpenOptionsOutput;
+use crate::repair::OpenOptionsRepair;
+use crate::repair::RepairMessage;
+use crate::utils;
 
 /// A collection of [`Log`]s that get rotated or deleted automatically when they
 /// exceed size or count limits.
@@ -33,6 +48,11 @@ pub struct RotateLog {
     // fails to load.
     logs_len: AtomicUsize,
     latest: u8,
+    // Indicate an active reader. Destrictive writes (repair) are unsafe.
+    reader_lock: Option<ScopedDirLock>,
+    // Run after log.sync(). For testing purpose only.
+    #[cfg(test)]
+    hook_after_log_sync: Option<Box<dyn Fn()>>,
 }
 
 // On disk, a RotateLog is a directory containing:
@@ -44,10 +64,10 @@ const LATEST_FILE: &str = "latest";
 /// Options used to configure how a [`RotateLog`] is opened.
 #[derive(Clone)]
 pub struct OpenOptions {
-    max_bytes_per_log: u64,
-    max_log_count: u8,
-    log_open_options: log::OpenOptions,
-    auto_sync_threshold: Option<u64>,
+    pub(crate) max_bytes_per_log: u64,
+    pub(crate) max_log_count: u8,
+    pub(crate) log_open_options: log::OpenOptions,
+    pub(crate) auto_sync_threshold: Option<u64>,
 }
 
 impl OpenOptions {
@@ -141,6 +161,7 @@ impl OpenOptions {
     pub fn open(&self, dir: impl AsRef<Path>) -> crate::Result<RotateLog> {
         let dir = dir.as_ref();
         let result: crate::Result<_> = (|| {
+            let reader_lock = ScopedDirLock::new_with_options(dir, &READER_LOCK_OPTS)?;
             let span = debug_span!("RotateLog::open", dir = &dir.to_string_lossy().as_ref());
             let _guard = span.enter();
 
@@ -217,6 +238,9 @@ impl OpenOptions {
                 logs,
                 logs_len,
                 latest,
+                reader_lock: Some(reader_lock),
+                #[cfg(test)]
+                hook_after_log_sync: None,
             })
         })();
 
@@ -236,6 +260,9 @@ impl OpenOptions {
                 logs,
                 logs_len,
                 latest: 0,
+                reader_lock: None,
+                #[cfg(test)]
+                hook_after_log_sync: None,
             })
         })();
         result.context("in rotate::OpenOptions::create_in_memory")
@@ -247,9 +274,10 @@ impl OpenOptions {
     pub fn repair(&self, dir: impl AsRef<Path>) -> crate::Result<String> {
         let dir = dir.as_ref();
         (|| -> crate::Result<_> {
-            let _lock = ScopedDirLock::new(&dir)?;
+            let _lock = ScopedDirLock::new(dir)?;
 
-            let mut message = String::new();
+            let mut message = RepairMessage::new(dir);
+            message += &format!("Processing RotateLog: {:?}\n", dir);
             let read_dir = dir.read_dir().context(dir, "cannot readdir")?;
             let mut ids = Vec::new();
 
@@ -290,7 +318,7 @@ impl OpenOptions {
                 },
             };
 
-            Ok(message)
+            Ok(message.into_string())
         })()
         .context(|| format!("in rotate::OpenOptions::repair({:?})", dir))
     }
@@ -299,6 +327,14 @@ impl OpenOptions {
 impl OpenOptionsRepair for OpenOptions {
     fn open_options_repair(&self, dir: impl AsRef<Path>) -> crate::Result<String> {
         OpenOptions::repair(self, dir.as_ref())
+    }
+}
+
+impl OpenOptionsOutput for OpenOptions {
+    type Output = RotateLog;
+
+    fn open_path(&self, path: &Path) -> crate::Result<Self::Output> {
+        self.open(path)
     }
 }
 
@@ -352,6 +388,21 @@ impl RotateLog {
         result
             .context(|| format!("in RotateLog::lookup({}, {:?})", index_id, key.as_ref()))
             .context(|| format!("  RotateLog.dir = {:?}", self.dir))
+    }
+
+    /// Convert a slice to [`Bytes`].
+    ///
+    /// Do not copy the slice if it's from the main on-disk buffer of
+    /// one of the loaded logs.
+    pub fn slice_to_bytes(&self, slice: &[u8]) -> Bytes {
+        for log in &self.logs {
+            if let Some(log) = log.get() {
+                if log.disk_buf.range_of_slice(slice).is_some() {
+                    return log.slice_to_bytes(slice);
+                }
+            }
+        }
+        Bytes::copy_from_slice(slice)
     }
 
     /// Look up an entry using the given index. The `index_id` is the index of
@@ -443,7 +494,7 @@ impl RotateLog {
                             match filter(&context, content).map_err(|err| {
                                 crate::Error::wrap(err, "failed to run filter function")
                             })? {
-                                FlushFilterOutput::Drop => (),
+                                FlushFilterOutput::Drop => {}
                                 FlushFilterOutput::Keep => log.append(content)?,
                                 FlushFilterOutput::Replace(content) => log.append(content)?,
                             }
@@ -461,11 +512,17 @@ impl RotateLog {
                 }
 
                 let size = self.writable_log().flush()?;
+
+                #[cfg(test)]
+                if let Some(func) = self.hook_after_log_sync.as_ref() {
+                    func();
+                }
+
                 if size >= self.open_options.max_bytes_per_log {
                     // `self.writable_log()` will be rotated (i.e., becomes immutable).
                     // Make sure indexes are up-to-date so reading it would not require
                     // building missing indexes in-memory.
-                    self.writable_log().finalize_indexes()?;
+                    self.writable_log().finalize_indexes(&lock)?;
                     self.rotate_internal(&lock)?;
                 }
             }
@@ -476,6 +533,22 @@ impl RotateLog {
         result
             .context("in RotateLog::sync")
             .context(|| format!("  RotateLog.dir = {:?}", self.dir))
+    }
+
+    /// Attempt to remove outdated logs.
+    ///
+    /// Does nothing if the content of the 'latest' file has changed on disk,
+    /// which indicates rotation was triggered elsewhere, or the [`RotateLog`]
+    /// is in-memory.
+    pub fn remove_old_logs(&mut self) -> crate::Result<()> {
+        if let Some(dir) = &self.dir {
+            let lock = ScopedDirLock::new(dir)?;
+            let latest = read_latest(dir)?;
+            if latest == self.latest {
+                self.try_remove_old_logs(&lock);
+            }
+        }
+        Ok(())
     }
 
     /// Force create a new [`Log`]. Bump latest.
@@ -526,6 +599,7 @@ impl RotateLog {
             for entry in read_dir {
                 if let Ok(entry) = entry {
                     let name = entry.file_name();
+                    debug!("Inspecting {:?} for rotate log removal", name);
                     if let Some(name) = name.to_str() {
                         if let Ok(id) = name.parse::<u8>() {
                             if (latest >= earliest && (id > latest || id < earliest))
@@ -539,8 +613,35 @@ impl RotateLog {
                                 // Newly opened or flushed RotateLog will unmap files.
                                 // New rotation would trigger remove_dir_all to try
                                 // remove old logs again.
-                                let _ = fs::remove_file(entry.path().join(log::META_FILE))
-                                    .and_then(|_| fs::remove_dir_all(entry.path()));
+                                match fs::remove_file(entry.path().join(log::META_FILE)) {
+                                    Ok(()) => {}
+                                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                                        // Meta file is already deleted.
+                                    }
+                                    Err(e) => {
+                                        // Don't delete the log if we were unable to delete the
+                                        // meta file.
+                                        debug!(
+                                            "Error removing rotate log meta: {:?} {:?}",
+                                            name, e
+                                        );
+                                        continue;
+                                    }
+                                }
+
+                                // Delete the rest of the directory.
+                                let res = fs::remove_dir_all(entry.path());
+                                match res {
+                                    Ok(_) => debug!("Removed rotate log: {:?}", name),
+                                    Err(err) => {
+                                        debug!("Error removing rotate log directory: {:?}", err)
+                                    }
+                                };
+                            } else {
+                                debug!(
+                                    "Not removing rotate log: {:?} (latest: {:?}, earliest: {:?})",
+                                    name, latest, earliest
+                                );
                             }
                         }
                     }
@@ -601,8 +702,8 @@ impl RotateLog {
     }
 
     /// Iterate over all dirty entries.
-    pub fn iter_dirty(&mut self) -> impl Iterator<Item = crate::Result<&[u8]>> {
-        self.writable_log().iter_dirty()
+    pub fn iter_dirty(&self) -> impl Iterator<Item = crate::Result<&[u8]>> {
+        self.logs[0].get().unwrap().iter_dirty()
     }
 }
 
@@ -847,9 +948,10 @@ fn guess_latest(mut ids: Vec<u8>) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use log::IndexOutput;
     use tempfile::tempdir;
+
+    use super::*;
 
     #[test]
     fn test_open() {
@@ -858,20 +960,39 @@ mod tests {
 
         assert!(OpenOptions::new().create(false).open(&path).is_err());
         assert!(OpenOptions::new().create(true).open(&path).is_ok());
-        assert!(OpenOptions::new()
-            .checksum_type(log::ChecksumType::Xxhash64)
-            .create(false)
-            .open(&path)
-            .is_ok());
+        assert!(
+            OpenOptions::new()
+                .checksum_type(log::ChecksumType::Xxhash64)
+                .create(false)
+                .open(&path)
+                .is_ok()
+        );
     }
 
     // lookup via index 0
     fn lookup<'a>(rotate: &'a RotateLog, key: &[u8]) -> Vec<&'a [u8]> {
-        rotate
+        let values = rotate
             .lookup(0, key.to_vec())
             .unwrap()
             .collect::<crate::Result<Vec<&[u8]>>>()
-            .unwrap()
+            .unwrap();
+        for value in &values {
+            let b1 = rotate.slice_to_bytes(value);
+            let b2 = rotate.slice_to_bytes(value);
+            // Dirty entires cannot be zero-copied.
+            if rotate
+                .iter_dirty()
+                .any(|i| i.unwrap().as_ptr() == value.as_ptr())
+            {
+                continue;
+            }
+            assert_eq!(
+                b1.as_ptr(),
+                b2.as_ptr(),
+                "slice_to_bytes should return zero-copy"
+            );
+        }
+        values
     }
 
     fn iter(rotate: &RotateLog) -> Vec<&[u8]> {
@@ -939,6 +1060,51 @@ mod tests {
         assert!(!dir.path().join("0").exists());
     }
 
+    #[test]
+    fn test_manual_remove_old_logs() {
+        let dir = tempdir().unwrap();
+        let dir = &dir;
+        let open = |n: u8| -> RotateLog {
+            OpenOptions::new()
+                .create(true)
+                .max_bytes_per_log(1)
+                .max_log_count(n)
+                .open(dir)
+                .unwrap()
+        };
+        let read_all =
+            |log: &RotateLog| -> Vec<Vec<u8>> { log.iter().map(|v| v.unwrap().to_vec()).collect() };
+
+        // Create 5 logs
+        {
+            let mut rotate = open(5);
+            for i in 0..5 {
+                rotate.append(vec![i]).unwrap();
+                rotate.sync().unwrap();
+            }
+        }
+
+        // Content depends on max_log_count.
+        {
+            let rotate = open(4);
+            assert_eq!(read_all(&rotate), [[2], [3], [4]]);
+            let rotate = open(3);
+            assert_eq!(read_all(&rotate), [[3], [4]]);
+        }
+
+        // Remove old logs.
+        {
+            let mut rotate = open(3);
+            rotate.remove_old_logs().unwrap();
+        }
+
+        // Verify that [2] is removed.
+        {
+            let rotate = open(4);
+            assert_eq!(read_all(&rotate), [[3], [4]]);
+        }
+    }
+
     fn test_wrapping_rotate(max_log_count: u8) {
         let dir = tempdir().unwrap();
         let mut rotate = OpenOptions::new()
@@ -953,7 +1119,7 @@ mod tests {
                 .unwrap()
                 .map(|entry| entry.unwrap().file_name().into_string().unwrap())
                 // On Windows, the "lock" file was created by open_dir.
-                .filter(|name| name != "lock")
+                .filter(|name| name != "lock" && name != "rlock")
                 .count()
         };
 
@@ -1296,7 +1462,7 @@ mod tests {
             .max_log_count(3)
             .open(&dir)
             .unwrap();
-        for &i in [1, 2].iter() {
+        for i in [1, 2] {
             rotate.append(vec![b'a'; 101]).unwrap();
             assert_eq!(rotate.sync().unwrap(), i); // trigger rotate
         }
@@ -1313,10 +1479,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let opts = OpenOptions::new()
             .create(true)
-            .index_defs(vec![IndexDef::new("idx", |_| {
-                vec![IndexOutput::Reference(0..2)]
-            })
-            .lag_threshold(u64::max_value())])
+            .index_defs(vec![
+                IndexDef::new("idx", |_| vec![IndexOutput::Reference(0..2)])
+                    .lag_threshold(u64::max_value()),
+            ])
             .max_bytes_per_log(100)
             .max_log_count(3);
 
@@ -1372,6 +1538,58 @@ mod tests {
         assert_eq!(rotate.logs()[0].iter_dirty().count(), 1);
         rotate.append(vec![b'x'; 50]).unwrap(); // trigger sync
         assert_eq!(rotate.logs()[0].iter_dirty().count(), 0);
+    }
+
+    #[test]
+    fn test_auto_sync_threshold_with_racy_index_update_on_open() {
+        fn index_defs(lag_threshold: u64) -> Vec<IndexDef> {
+            let index_names = ["a"];
+            (0..index_names.len())
+                .map(|i| {
+                    IndexDef::new(&index_names[i], |_| vec![IndexOutput::Reference(0..1)])
+                        .lag_threshold(lag_threshold)
+                })
+                .collect()
+        }
+
+        fn open_opts(lag_threshold: u64) -> OpenOptions {
+            let index_defs = index_defs(lag_threshold);
+            OpenOptions::new()
+                .auto_sync_threshold(1000)
+                .max_bytes_per_log(400)
+                .max_log_count(10)
+                .create(true)
+                .index_defs(index_defs)
+        }
+
+        let dir = tempdir().unwrap();
+        let path = dir.path();
+        let data: &[u8] = &[b'x'; 100];
+        let n = 10;
+        for _i in 0..n {
+            let mut rotate1 = open_opts(300).open(path).unwrap();
+            rotate1.hook_after_log_sync = Some({
+                let path = path.to_path_buf();
+                Box::new(move || {
+                    // This might updating indexes (see D20042046 and D20286509).
+                    let rotate2 = open_opts(100).open(&path).unwrap();
+                    // Force loading "lazy" indexes.
+                    let _all = rotate2.iter().collect::<Result<Vec<_>, _>>().unwrap();
+                })
+            });
+            rotate1.append(data).unwrap();
+            rotate1.sync().unwrap();
+        }
+
+        // Verify that data can be read through index.
+        let rotate1 = open_opts(300).open(path).unwrap();
+        let mut count = 0;
+        for entry in rotate1.lookup(0, b"x" as &[u8]).unwrap() {
+            let entry = entry.unwrap();
+            assert_eq!(entry, data);
+            count += 1;
+        }
+        assert_eq!(count, n);
     }
 
     #[test]
@@ -1432,15 +1650,19 @@ mod tests {
         utils::atomic_write(&latest_path, "NaN", false).unwrap();
         assert!(opts.open(&dir).is_err());
         assert_eq!(
-            opts.repair(&dir).unwrap(),
+            opts.repair(&dir)
+                .unwrap()
+                .lines()
+                .filter(|l| !l.contains("Processing"))
+                .collect::<Vec<_>>()
+                .join("\n"),
             r#"Attempt to repair log "0"
 Verified 1 entries, 223 bytes in log
 Attempt to repair log "1"
 Verified 1 entries, 223 bytes in log
 Attempt to repair log "2"
 Verified 0 entries, 12 bytes in log
-Reset latest to 2
-"#
+Reset latest to 2"#
         );
         opts.open(&dir).unwrap();
 
@@ -1450,15 +1672,19 @@ Reset latest to 2
 
         // Repair can fix it.
         assert_eq!(
-            opts.repair(&dir).unwrap(),
+            opts.repair(&dir)
+                .unwrap()
+                .lines()
+                .filter(|l| !l.contains("Processing"))
+                .collect::<Vec<_>>()
+                .join("\n"),
             r#"Attempt to repair log "0"
 Verified 1 entries, 223 bytes in log
 Attempt to repair log "1"
 Verified 1 entries, 223 bytes in log
 Attempt to repair log "2"
 Verified 0 entries, 12 bytes in log
-Reset latest to 2
-"#
+Reset latest to 2"#
         );
         opts.open(&dir).unwrap();
     }
@@ -1498,15 +1724,8 @@ Reset latest to 2
         let dir = tempdir().unwrap();
 
         // Release mode runs much faster.
-        #[cfg(debug_assertions)]
-        const THREAD_COUNT: u8 = 10;
-        #[cfg(not(debug_assertions))]
-        const THREAD_COUNT: u8 = 30;
-
-        #[cfg(debug_assertions)]
-        const WRITE_COUNT_PER_THREAD: u8 = 10;
-        #[cfg(not(debug_assertions))]
-        const WRITE_COUNT_PER_THREAD: u8 = 50;
+        const THREAD_COUNT: u8 = if cfg!(debug_assertions) { 10 } else { 30 };
+        const WRITE_COUNT_PER_THREAD: u8 = if cfg!(debug_assertions) { 10 } else { 50 };
 
         // Some indexes. They have different lag_threshold.
         fn index_ref(data: &[u8]) -> Vec<IndexOutput> {
@@ -1530,7 +1749,8 @@ Reset latest to 2
             .max_bytes_per_log(200)
             .index_defs(indexes);
 
-        use std::sync::{Arc, Barrier};
+        use std::sync::Arc;
+        use std::sync::Barrier;
         let barrier = Arc::new(Barrier::new(THREAD_COUNT as usize));
         let threads: Vec<_> = (0..THREAD_COUNT)
             .map(|i| {

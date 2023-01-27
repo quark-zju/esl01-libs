@@ -1,8 +1,8 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 //! Index support for `log`.
@@ -55,38 +55,58 @@
 // - The "INLINE_LEAF" type is basically an inlined version of EXT_KEY and LINK, to save space.
 // - The "ROOT_LEN" is reversed so it can be read byte-by-byte from the end of a file.
 
-use crate::utils::{xxhash, xxhash32};
-use minibytes::Bytes;
 use std::borrow::Cow;
-use std::cmp::Ordering::{Equal, Greater, Less};
-use std::fmt::{self, Debug, Formatter};
-use std::fs::{self, File};
+use std::cmp::Ordering::Equal;
+use std::cmp::Ordering::Greater;
+use std::cmp::Ordering::Less;
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::fs;
+use std::fs::File;
 use std::hash::Hasher;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::io::Write;
 use std::mem::size_of;
-use std::ops::{
-    Bound::{self, Excluded, Included, Unbounded},
-    Deref, RangeBounds,
-};
-use std::path::{Path, PathBuf};
-use std::sync::{
-    atomic::{
-        AtomicU64,
-        Ordering::{AcqRel, Acquire, Relaxed},
-    },
-    Arc,
-};
-use twox_hash::XxHash;
+use std::ops::Bound;
+use std::ops::Bound::Excluded;
+use std::ops::Bound::Included;
+use std::ops::Bound::Unbounded;
+use std::ops::Deref;
+use std::ops::RangeBounds;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::AcqRel;
+use std::sync::atomic::Ordering::Acquire;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::Arc;
 
-use crate::base16::{base16_to_base256, single_hex_to_base16, Base16Iter};
-use crate::errors::{IoResultExt, ResultExt};
-use crate::lock::ScopedFileLock;
-use crate::utils::{self, mmap_bytes};
-
-use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::ByteOrder;
+use byteorder::LittleEndian;
+use byteorder::ReadBytesExt;
+use byteorder::WriteBytesExt;
 use fs2::FileExt;
+use minibytes::Bytes;
 use tracing::debug_span;
-use vlqencoding::{VLQDecodeAt, VLQEncode};
+use twox_hash::XxHash;
+use vlqencoding::VLQDecodeAt;
+use vlqencoding::VLQEncode;
+
+use crate::base16::base16_to_base256;
+use crate::base16::single_hex_to_base16;
+use crate::base16::Base16Iter;
+use crate::config;
+use crate::errors::IoResultExt;
+use crate::errors::ResultExt;
+use crate::lock::ScopedFileLock;
+use crate::utils;
+use crate::utils::mmap_bytes;
+use crate::utils::xxhash;
+use crate::utils::xxhash32;
 
 //// Structures and serialization
 
@@ -144,14 +164,38 @@ struct MemChecksum {
     /// This is also the offset of the current Checksum entry.
     end: u64,
 
+    /// Tracks the chain length. Used to detect whether `checksum_max_chain_len`
+    /// is exceeded or not.
+    chain_len: u32,
+
     /// Each chunk has (1 << chunk_size_logarithmarithm) bytes. The last chunk
     /// can be shorter.
     chunk_size_logarithm: u32,
 
     /// Checksums per chunk.
+    ///
+    /// The start of a chunk always aligns with the chunk size, which might not
+    /// match `start`. For example, given the `start` and `end` shown below:
+    ///
+    /// ```plain,ignore
+    /// | chunk 1 (1MB) | chunk 2 (1MB) | chunk 3 (1MB) | chunk 4 (200K) |
+    ///                     |<-start                                end->|
+    /// ```
+    ///
+    /// The `xxhash_list` would be:
+    ///
+    /// ```plain,ignore
+    /// [xxhash(chunk 2 (1MB)), xxhash(chunk 3 (1MB)), xxhash(chunk 4 (200K))]
+    /// ```
+    ///
+    /// For the root checksum (`Index::chunksum`), the `xxhash_list` should
+    /// conver the entire buffer, as if `start` is 0 (but `start` is not 0).
     xxhash_list: Vec<u64>,
 
-    /// Whether chunks are checked.
+    /// Whether chunks are checked against `xxhash_list`.
+    ///
+    /// Stored in a bit vector. `checked.len() * 64` should be >=
+    /// `xxhash_list.len()`.
     checked: Vec<AtomicU64>,
 }
 
@@ -650,7 +694,7 @@ impl LeafOffset {
             match key_offset.to_typed(&*index) {
                 Ok(TypedOffset::Key(x)) => x.mark_unused(index),
                 Ok(TypedOffset::ExtKey(x)) => x.mark_unused(index),
-                _ => (),
+                _ => {}
             };
             index.dirty_leafs[self.dirty_index()].mark_unused()
         }
@@ -812,7 +856,7 @@ impl<'a> Iterator for RangeIter<'a> {
         let result = Self::step(self.index, &mut self.front_stack, Back, exclusive);
         match result {
             Some(Err(_)) | None => self.completed = true,
-            _ => (),
+            _ => {}
         }
         result
     }
@@ -829,7 +873,7 @@ impl<'a> DoubleEndedIterator for RangeIter<'a> {
         let result = Self::step(self.index, &mut self.back_stack, Front, exclusive);
         match result {
             Some(Err(_)) | None => self.completed = true,
-            _ => (),
+            _ => {}
         }
         result
     }
@@ -974,7 +1018,16 @@ impl ExtKeyOffset {
             (start, len, Some(TYPE_BYTES + vlq_len1 + vlq_len2))
         };
         let key_buf = index.key_buf.as_ref();
-        Ok((key_buf.slice(start, len), entry_size))
+        let key_content = match key_buf.slice(start, len) {
+            Some(k) => k,
+            None => {
+                return Err(index.corruption(format!(
+                    "key buffer is invalid when reading referred keys at {}",
+                    start
+                )));
+            }
+        };
+        Ok((key_content, entry_size))
     }
 
     /// Create a new in-memory external key entry. The key cannot be empty.
@@ -1002,7 +1055,10 @@ fn check_type(index: impl IndexBuf, offset: usize, expected: u8) -> crate::Resul
         .get(offset)
         .ok_or_else(|| index.range_error(offset, 1))?);
     if typeint != expected {
-        Err(index.corruption(format!("type mismatch at offset {}", offset)))
+        Err(index.corruption(format!(
+            "type mismatch at offset {} expected {} but got {}",
+            offset, expected, typeint
+        )))
     } else {
         Ok(())
     }
@@ -1430,96 +1486,115 @@ impl MemRoot {
 }
 
 impl MemChecksum {
-    fn read_from(index: &impl IndexBuf, offset: u64) -> crate::Result<(Self, usize)> {
-        if offset == 0 {
-            // Special case: an empty checksum.
-            return Ok((Self::default(), 0));
+    fn read_from(index: &impl IndexBuf, start_offset: u64) -> crate::Result<(Self, usize)> {
+        let span = debug_span!("MemRadix::read", offset = start_offset);
+        let _entered = span.enter();
+        let mut result = Self::default();
+        let mut size: usize = 0;
+
+        let mut offset = start_offset as usize;
+        while offset > 0 {
+            let mut cur: usize = offset;
+
+            check_type(&index, cur, TYPE_CHECKSUM)?;
+            cur += TYPE_BYTES;
+
+            let (previous_offset, vlq_len): (u64, _) = index
+                .buf()
+                .read_vlq_at(cur)
+                .context(index.path(), "cannot read previous_checksum_offset")
+                .corruption()?;
+            cur += vlq_len;
+
+            let (chunk_size_logarithm, vlq_len): (u32, _) = index
+                .buf()
+                .read_vlq_at(cur)
+                .context(index.path(), "cannot read chunk_size_logarithm")
+                .corruption()?;
+
+            if chunk_size_logarithm > 31 {
+                return Err(crate::Error::corruption(
+                    index.path(),
+                    format!(
+                        "invalid chunk_size_logarithm {} at {}",
+                        chunk_size_logarithm, cur
+                    ),
+                ));
+            }
+            cur += vlq_len;
+
+            let chunk_size = 1usize << chunk_size_logarithm;
+            let chunk_needed = (offset + chunk_size - 1) >> chunk_size_logarithm;
+
+            let is_initial_checksum = start_offset == offset as u64;
+
+            // Initialize our Self result in our first iteration.
+            if is_initial_checksum {
+                result.set_chunk_size_logarithm(index.buf(), chunk_size_logarithm)?;
+
+                result.xxhash_list.resize(chunk_needed, 0);
+                result.start = previous_offset;
+                result.end = offset as u64;
+
+                let checked_needed = (result.xxhash_list.len() + 63) / 64;
+                result.checked.resize_with(checked_needed, Default::default);
+            }
+            result.chain_len = result.chain_len.saturating_add(1);
+
+            //    0     1     2     3     4     5
+            // |chunk|chunk|chunk|chunk|chunk|chunk|
+            // |--------------|-----------------|---
+            // 0              ^ previous        ^ offset
+            //
+            // The previous Checksum entry covers chunk 0,1,2(incomplete).
+            // This Checksum entry covers chunk 2(complete),3,4,5(incomplete).
+
+            // Read the new checksums.
+            let start_chunk_index = (previous_offset >> chunk_size_logarithm) as usize;
+            for i in start_chunk_index..chunk_needed {
+                let incomplete_chunk = offset % chunk_size > 0 && i == chunk_needed - 1;
+
+                // Don't record incomplete chunk hashes for previous checksums
+                // since the "next" checksum (i.e. previous loop iteration) will
+                // have already written the complete chunk's hash.
+                if is_initial_checksum || !incomplete_chunk {
+                    result.xxhash_list[i] = (&index.buf()[cur..])
+                        .read_u64::<LittleEndian>()
+                        .context(index.path(), "cannot read xxhash for checksum")?;
+                }
+                cur += 8;
+            }
+
+            // Check the checksum buffer itself.
+            let xx32_read = (&index.buf()[cur..])
+                .read_u32::<LittleEndian>()
+                .context(index.path(), "cannot read xxhash32 for checksum")?;
+            let xx32_self = xxhash32(&index.buf()[offset as usize..cur as usize]);
+            if xx32_read != xx32_self {
+                return Err(crate::Error::corruption(
+                    index.path(),
+                    format!(
+                        "checksum at {} fails integrity check ({} != {})",
+                        offset, xx32_read, xx32_self
+                    ),
+                ));
+            }
+            cur += 4;
+
+            if is_initial_checksum {
+                size = cur - offset;
+            }
+
+            offset = previous_offset as usize;
         }
+        span.record("chain_len", result.chain_len);
 
-        let offset = offset as usize;
-        let mut cur = offset;
-        check_type(&index, offset, TYPE_CHECKSUM)?;
-        cur += TYPE_BYTES;
-
-        let (previous_offset, vlq_len): (u64, _) = index
-            .buf()
-            .read_vlq_at(cur)
-            .context(index.path(), "cannot read previous_checksum_offset")
-            .corruption()?;
-        cur += vlq_len;
-
-        let (chunk_size_logarithm, vlq_len): (u32, _) = index
-            .buf()
-            .read_vlq_at(cur)
-            .context(index.path(), "cannot read chunk_size_logarithm")
-            .corruption()?;
-        if chunk_size_logarithm > 31 {
-            return Err(crate::Error::corruption(
-                index.path(),
-                format!(
-                    "invalid chunk_size_logarithm {} at {}",
-                    chunk_size_logarithm, cur
-                ),
-            ));
-        }
-        cur += vlq_len;
-
-        // Load the previous chunk.
-        // This is currently bounded to O(file_len / chunk_size). If the index
-        // is too large it might stack overflow.
-        // NOTE: Consider switching to a non-recursive implementation, or
-        // limit the chain length.
-        let mut result = Self::read_from(index, previous_offset)?.0;
-        result.set_chunk_size_logarithm(index.buf(), chunk_size_logarithm)?;
-        result.start = previous_offset;
-        result.end = offset as u64;
-
-        let chunk_size = 1usize << chunk_size_logarithm;
-        let chunk_needed = (offset + chunk_size - 1) >> chunk_size_logarithm;
-        result.xxhash_list.resize(chunk_needed, 0);
-
-        //    0     1     2     3     4     5
-        // |chunk|chunk|chunk|chunk|chunk|chunk|
-        // |--------------|-----------------|---
-        // 0              ^ previous        ^ offset
-        //
-        // The previous Checksum entry covers chunk 0,1,2(incomplete).
-        // This Checksum entry covers chunk 2(complete),3,4,5(incomplete).
-
-        // Read the new chunksums.
-        let start_chunk_index = (previous_offset >> chunk_size_logarithm) as usize;
-        for i in start_chunk_index..result.xxhash_list.len() {
-            result.xxhash_list[i] = (&index.buf()[cur..])
-                .read_u64::<LittleEndian>()
-                .context(index.path(), "cannot read xxhash for checksum")?;
-            cur += 8;
-        }
-
-        // Check the checksum buffer itself.
-        let xx32_read = (&index.buf()[cur..])
-            .read_u32::<LittleEndian>()
-            .context(index.path(), "cannot read xxhash32 for checksum")?;
-        let xx32_self = xxhash32(&index.buf()[offset as usize..cur as usize]);
-        if xx32_read != xx32_self {
-            return Err(crate::Error::corruption(
-                index.path(),
-                format!(
-                    "checksum at {} fails integrity check ({} != {})",
-                    offset, xx32_read, xx32_self
-                ),
-            ));
-        }
-        cur += 4;
-
-        let checked_needed = (result.xxhash_list.len() + 63) / 64;
-        result.checked.resize_with(checked_needed, Default::default);
-
-        Ok((result, cur - offset))
+        Ok((result, size))
     }
 
     /// Incrementally update the checksums so it covers the file content + `append_buf`.
     /// Assume the file content is append-only.
-    /// Call this before writing write_to.
+    /// Call this before calling `write_to`.
     fn update(
         &mut self,
         old_buf: &[u8],
@@ -1548,20 +1623,25 @@ impl MemChecksum {
             ));
         }
 
-        //              start_chunk_offset
+        //        start_chunk_offset (start of chunk including self.end)
         //                   v
-        //                   |(1)-|
+        //                   |(1)|
         // |chunk|chunk|chunk|chunk|chunk|chunk|chunk|chunk|chunk|
         //                   |---file_buf---|
         // |--------------file--------------|
-        // |-------old_buf--------|
-        // |-----(2)-----|---(3)--|         |---append_buf---|
-        //               ^        ^         ^                ^
-        //          self.start  self.end  file_len     new_total_len
+        // |-------old_buf-------|
+        // |-----(2)-----|--(3)--|---(4)----|---append_buf---|
+        //               ^       ^          ^                ^
+        //          self.start self.end   file_len     new_total_len
         //
-        // (1): range being rewritten
+        // (1): range being re-checksummed
         // (2): covered by the previous Checksum
         // (3): covered by the current Checksum
+        // (4): range written on-disk after `Index::open` (ex. by another process)
+        //
+        // old_buf:    buffer read at open time.
+        // file:       buffer read at flush time (right now, with a lock).
+        // append_buf: buffer to append to the file (protected by the same lock).
 
         let file_buf = {
             let mut file_buf = vec![0; (file_len - start_chunk_offset) as usize];
@@ -1614,6 +1694,13 @@ impl MemChecksum {
         self.end = new_total_len;
 
         Ok(())
+    }
+
+    /// Extend the checksum range to cover the entire range of the index buffer
+    /// so the next open would only read O(1) checksum entries.
+    fn flatten(&mut self) {
+        self.start = 0;
+        self.chain_len = 1;
     }
 
     fn write_to<W: Write>(&self, writer: &mut W, _offset_map: &OffsetMap) -> io::Result<usize> {
@@ -1721,6 +1808,7 @@ impl Clone for MemChecksum {
         Self {
             start: self.start,
             end: self.end,
+            chain_len: self.chain_len,
             chunk_size_logarithm: self.chunk_size_logarithm,
             xxhash_list: self.xxhash_list.clone(),
             checked: self
@@ -1738,6 +1826,7 @@ impl Default for MemChecksum {
         Self {
             start: 0,
             end: 0,
+            chain_len: 0,
             chunk_size_logarithm: 20, // chunk_size: 1MB.
             xxhash_list: Vec::new(),
             checked: Vec::new(),
@@ -1816,7 +1905,8 @@ enum Side {
     Front,
     Back,
 }
-use Side::{Back, Front};
+use Side::Back;
+use Side::Front;
 
 /// State used by [`RangeIter`].
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1898,8 +1988,11 @@ pub struct Index {
     // Log uses this field for error messages.
     pub(crate) path: PathBuf,
 
-    // OpenOptions
-    open_options: OpenOptions,
+    // Options
+    checksum_enabled: bool,
+    checksum_max_chain_len: u32,
+    fsync: bool,
+    write: Option<bool>,
 
     // Used by `clear_dirty`.
     clean_root: MemRoot,
@@ -1925,13 +2018,13 @@ pub struct Index {
 /// and expose them as if it's contiguous.
 pub trait ReadonlyBuffer {
     /// Get a slice using the given offset.
-    fn slice(&self, start: u64, len: u64) -> &[u8];
+    fn slice(&self, start: u64, len: u64) -> Option<&[u8]>;
 }
 
 impl<T: AsRef<[u8]>> ReadonlyBuffer for T {
     #[inline]
-    fn slice(&self, start: u64, len: u64) -> &[u8] {
-        &self.as_ref()[start as usize..(start + len) as usize]
+    fn slice(&self, start: u64, len: u64) -> Option<&[u8]> {
+        self.as_ref().get(start as usize..(start + len) as usize)
     }
 }
 
@@ -1951,6 +2044,7 @@ pub enum InsertKey<'a> {
 /// an [`Index`] structure.
 #[derive(Clone)]
 pub struct OpenOptions {
+    checksum_max_chain_len: u32,
     checksum_chunk_size_logarithm: u32,
     checksum_enabled: bool,
     fsync: bool,
@@ -1963,12 +2057,14 @@ impl OpenOptions {
     #[allow(clippy::new_without_default)]
     /// Create [`OpenOptions`] with default configuration:
     /// - checksum enabled, with 1MB chunk size
+    /// - checksum max chain length is `config::INDEX_CHECKSUM_MAX_CHAIN_LEN` (default: 10)
     /// - no external key buffer
     /// - no fsync
     /// - read root entry from the end of the file
     /// - open as read-write but fallback to read-only
     pub fn new() -> OpenOptions {
         OpenOptions {
+            checksum_max_chain_len: config::INDEX_CHECKSUM_MAX_CHAIN_LEN.load(Acquire),
             checksum_chunk_size_logarithm: 20,
             checksum_enabled: true,
             fsync: false,
@@ -1976,6 +2072,17 @@ impl OpenOptions {
             write: None,
             key_buf: None,
         }
+    }
+
+    /// Set the maximum checksum chain length.
+    ///
+    /// If it is non-zero, and the checksum chain (linked list of checksum
+    /// entries needed to verify the entire index) exceeds the specified length,
+    /// they will be collapsed into a single checksum entry to make `open` more
+    /// efficient.
+    pub fn checksum_max_chain_len(&mut self, len: u32) -> &mut Self {
+        self.checksum_max_chain_len = len;
+        self
     }
 
     /// Set checksum chunk size as `1 << checksum_chunk_size_logarithm`.
@@ -2125,7 +2232,12 @@ impl OpenOptions {
                 file: Some(file),
                 buf: bytes,
                 path: path.to_path_buf(),
-                open_options,
+                // Deconstruct open_options instead of storing it whole, since it contains a
+                // permanent reference to the original key_buf mmap.
+                checksum_enabled: open_options.checksum_enabled,
+                checksum_max_chain_len: open_options.checksum_max_chain_len,
+                fsync: open_options.fsync,
+                write: open_options.write,
                 clean_root,
                 dirty_root,
                 checksum,
@@ -2162,7 +2274,10 @@ impl OpenOptions {
                 file: None,
                 buf,
                 path: PathBuf::new(),
-                open_options: self.clone(),
+                checksum_enabled: self.checksum_enabled,
+                checksum_max_chain_len: self.checksum_max_chain_len,
+                fsync: self.fsync,
+                write: self.write,
                 clean_root,
                 dirty_root,
                 checksum,
@@ -2355,7 +2470,10 @@ impl Index {
                 file,
                 buf: self.buf.clone(),
                 path: self.path.clone(),
-                open_options: self.open_options.clone(),
+                checksum_enabled: self.checksum_enabled,
+                checksum_max_chain_len: self.checksum_max_chain_len,
+                fsync: self.fsync,
+                write: self.write,
                 clean_root: self.clean_root.clone(),
                 dirty_root: self.dirty_root.clone(),
                 checksum: self.checksum.clone(),
@@ -2371,7 +2489,10 @@ impl Index {
                 file,
                 buf: self.buf.clone(),
                 path: self.path.clone(),
-                open_options: self.open_options.clone(),
+                checksum_enabled: self.checksum_enabled,
+                checksum_max_chain_len: self.checksum_max_chain_len,
+                fsync: self.fsync,
+                write: self.write,
                 clean_root: self.clean_root.clone(),
                 dirty_root: self.clean_root.clone(),
                 checksum: self.checksum.clone(),
@@ -2464,7 +2585,7 @@ impl Index {
             let span = debug_span!("Index::flush", path = self.path.to_string_lossy().as_ref());
             let _guard = span.enter();
 
-            if self.open_options.write == Some(false) {
+            if self.write == Some(false) {
                 return Err(crate::Error::path(
                     self.path(),
                     "cannot flush: Index opened with read-only mode",
@@ -2504,9 +2625,9 @@ impl Index {
                     .context(&path, "cannot seek to end")?;
                 if len < old_len {
                     let message = format!(
-                    "on-disk index is unexpectedly smaller ({} bytes) than its previous version ({} bytes)",
-                    len, old_len
-                );
+                        "on-disk index is unexpectedly smaller ({} bytes) than its previous version ({} bytes)",
+                        len, old_len
+                    );
                     // This is not a "corruption" - something has truncated the
                     // file, potentially recreating it. We haven't checked the
                     // new content, so it's not considered as "data corruption".
@@ -2594,10 +2715,16 @@ impl Index {
 
                 // Update and write Checksum if it's enabled.
                 let mut new_checksum = self.checksum.clone();
-                let checksum_len = if self.open_options.checksum_enabled {
+                let checksum_len = if self.checksum_enabled {
                     new_checksum
                         .update(&self.buf, lock.as_mut(), len, &buf)
                         .context(&path, "cannot read and update checksum")?;
+                    // Optionally merge the checksum entry for optimization.
+                    if self.checksum_max_chain_len > 0
+                        && new_checksum.chain_len >= self.checksum_max_chain_len
+                    {
+                        new_checksum.flatten();
+                    }
                     new_checksum.write_to(&mut buf, &offset_map).infallible()?
                 } else {
                     assert!(!self.checksum.is_enabled());
@@ -2613,7 +2740,7 @@ impl Index {
                     .write_all(&buf)
                     .context(&path, "cannot write new data to index")?;
 
-                if self.open_options.fsync {
+                if self.fsync || config::get_global_fsync() {
                     lock.as_mut().sync_all().context(&path, "cannot sync")?;
                 }
 
@@ -2646,10 +2773,10 @@ impl Index {
             // Outside critical section
             self.clear_dirty();
 
-            #[cfg(debug_assertions)]
-            #[cfg(test)]
-            self.verify()
-                .expect("sync() should not break checksum check");
+            if cfg!(all(debug_assertions, test)) {
+                self.verify()
+                    .expect("sync() should not break checksum check");
+            }
 
             Ok(new_len)
         })();
@@ -2863,7 +2990,14 @@ impl Index {
         let (key, key_buf_offset) = match key {
             InsertKey::Embed(k) => (k, None),
             InsertKey::Reference((start, len)) => {
-                let key = self.key_buf.as_ref().slice(start, len);
+                let key = match self.key_buf.as_ref().slice(start, len) {
+                    Some(k) => k,
+                    None => {
+                        return Err(
+                            self.corruption("key buffer is invalid when inserting referred keys")
+                        );
+                    }
+                };
                 // UNSAFE NOTICE: `key` is valid as long as `self.key_buf` is valid. `self.key_buf`
                 // won't be changed. So `self` can still be mutable without a read-only
                 // relationship with `key`.
@@ -3188,7 +3322,7 @@ impl Index {
                     radix.offsets[b2v as usize] = new_leaf_offset.into();
                     completed = true;
                 }
-                _ => (),
+                _ => {}
             }
 
             // Create the Radix entry, and connect it to the parent entry.
@@ -3470,13 +3604,15 @@ impl Debug for Index {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use quickcheck::quickcheck;
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::BTreeSet;
+    use std::collections::HashMap;
     use std::fs::File;
+
+    use quickcheck::quickcheck;
     use tempfile::tempdir;
 
     use super::InsertValue::PrependReplace;
+    use super::*;
 
     fn open_opts() -> OpenOptions {
         let mut opts = OpenOptions::new();
@@ -4154,20 +4290,21 @@ Disk[201]: Checksum { start: 126, end: 201, chunk_size_logarithm: 4, checksums.l
     fn test_checksum_bitflip_with_size(checksum_log_size: u32) {
         let dir = tempdir().unwrap();
 
-        // Debug build is much slower than release build. Limit the key length to 1-byte.
-        #[cfg(debug_assertions)]
-        let keys = vec![vec![0x13], vec![0x17], vec![]];
+        let keys = if cfg!(debug_assertions) {
+            // Debug build is much slower than release build. Limit the key length to 1-byte.
+            vec![vec![0x13], vec![0x17], vec![]]
+        } else {
+            // Release build can afford 2-byte key test.
+            vec![
+                vec![0x12, 0x34],
+                vec![0x12, 0x78],
+                vec![0x34, 0x56],
+                vec![0x34],
+                vec![0x78],
+                vec![0x78, 0x9a],
+            ]
+        };
 
-        // Release build can afford 2-byte key test.
-        #[cfg(not(debug_assertions))]
-        let keys = vec![
-            vec![0x12, 0x34],
-            vec![0x12, 0x78],
-            vec![0x34, 0x56],
-            vec![0x34],
-            vec![0x78],
-            vec![0x78, 0x9a],
-        ];
         let opts = open_opts()
             .checksum_chunk_size_logarithm(checksum_log_size)
             .clone();
@@ -4214,11 +4351,7 @@ Disk[201]: Checksum { start: 126, end: 201, chunk_size_logarithm: 4, checksums.l
             let detected = match index {
                 Err(_) => true,
                 Ok(index) => {
-                    #[cfg(debug_assertions)]
-                    let range = 0;
-                    #[cfg(not(debug_assertions))]
-                    let range = 0x10000;
-
+                    let range = if cfg!(debug_assertions) { 0 } else { 0x10000 };
                     (0..range).any(|key_int| {
                         let key = [(key_int >> 8) as u8, (key_int & 0xff) as u8];
                         is_corrupted(&index, &key)
@@ -4315,6 +4448,110 @@ Disk[410]: Root { radix: Disk[402] }
         );
     }
 
+    fn show_checksums(index: &Index) -> String {
+        let debug_str = format!("{:?}", index);
+        debug_str
+            .lines()
+            .filter_map(|l| {
+                if l.contains("Checksum") {
+                    Some(format!("\n                {}", l))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .concat()
+    }
+
+    #[test]
+    fn test_checksum_max_chain_len() {
+        // Test with the given max_chain_len config.
+        let t = |max_chain_len: u32| {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("i");
+            let mut index = open_opts()
+                .checksum_chunk_size_logarithm(7 /* chunk size: 127 */)
+                .checksum_max_chain_len(max_chain_len)
+                .open(&path)
+                .unwrap();
+            for i in 0..10u8 {
+                let data: Vec<u8> = if i % 2 == 0 { vec![i] } else { vec![i; 100] };
+                index.insert(&data, 1).unwrap();
+                index.flush().unwrap();
+                index.verify().unwrap();
+                // If reload from disk, it pass verification too.
+                let mut index2 = open_opts()
+                    .checksum_max_chain_len(max_chain_len)
+                    .open(&path)
+                    .unwrap();
+                index2.verify().unwrap();
+                // Create "racy" writes by flushing from another index.
+                if i % 3 == 0 {
+                    index2.insert(&data, 2).unwrap();
+                    index2.flush().unwrap();
+                }
+            }
+            show_checksums(&index)
+        };
+
+        // Unlimited chain. Chain: 1358 -> 1167 -> 1071 -> 818 -> 738 -> ...
+        assert_eq!(
+            t(0),
+            r#"
+                Disk[21]: Checksum { start: 0, end: 21, chunk_size_logarithm: 7, checksums.len(): 1 }
+                Disk[54]: Checksum { start: 0, end: 54, chunk_size_logarithm: 7, checksums.len(): 1 }
+                Disk[203]: Checksum { start: 0, end: 203, chunk_size_logarithm: 7, checksums.len(): 2 }
+                Disk[266]: Checksum { start: 203, end: 266, chunk_size_logarithm: 7, checksums.len(): 2 }
+                Disk[433]: Checksum { start: 266, end: 433, chunk_size_logarithm: 7, checksums.len(): 2 }
+                Disk[499]: Checksum { start: 433, end: 499, chunk_size_logarithm: 7, checksums.len(): 1 }
+                Disk[563]: Checksum { start: 433, end: 563, chunk_size_logarithm: 7, checksums.len(): 2 }
+                Disk[738]: Checksum { start: 563, end: 738, chunk_size_logarithm: 7, checksums.len(): 2 }
+                Disk[818]: Checksum { start: 738, end: 818, chunk_size_logarithm: 7, checksums.len(): 2 }
+                Disk[896]: Checksum { start: 818, end: 896, chunk_size_logarithm: 7, checksums.len(): 1 }
+                Disk[1071]: Checksum { start: 818, end: 1071, chunk_size_logarithm: 7, checksums.len(): 3 }
+                Disk[1167]: Checksum { start: 1071, end: 1167, chunk_size_logarithm: 7, checksums.len(): 2 }
+                Disk[1358]: Checksum { start: 1167, end: 1358, chunk_size_logarithm: 7, checksums.len(): 2 }"#
+        );
+
+        // Max chain len = 2. Chain: 1331 -> 1180 -> 0; 872 -> 761 -> 0; ...
+        assert_eq!(
+            t(2),
+            r#"
+                Disk[21]: Checksum { start: 0, end: 21, chunk_size_logarithm: 7, checksums.len(): 1 }
+                Disk[54]: Checksum { start: 0, end: 54, chunk_size_logarithm: 7, checksums.len(): 1 }
+                Disk[203]: Checksum { start: 0, end: 203, chunk_size_logarithm: 7, checksums.len(): 2 }
+                Disk[266]: Checksum { start: 203, end: 266, chunk_size_logarithm: 7, checksums.len(): 2 }
+                Disk[433]: Checksum { start: 0, end: 433, chunk_size_logarithm: 7, checksums.len(): 4 }
+                Disk[514]: Checksum { start: 433, end: 514, chunk_size_logarithm: 7, checksums.len(): 2 }
+                Disk[586]: Checksum { start: 433, end: 586, chunk_size_logarithm: 7, checksums.len(): 2 }
+                Disk[761]: Checksum { start: 0, end: 761, chunk_size_logarithm: 7, checksums.len(): 6 }
+                Disk[872]: Checksum { start: 761, end: 872, chunk_size_logarithm: 7, checksums.len(): 2 }
+                Disk[950]: Checksum { start: 0, end: 950, chunk_size_logarithm: 7, checksums.len(): 8 }
+                Disk[1180]: Checksum { start: 0, end: 1180, chunk_size_logarithm: 7, checksums.len(): 10 }
+                Disk[1331]: Checksum { start: 1180, end: 1331, chunk_size_logarithm: 7, checksums.len(): 2 }
+                Disk[1522]: Checksum { start: 0, end: 1522, chunk_size_logarithm: 7, checksums.len(): 12 }"#
+        );
+
+        // Max chain len = 1. All have start: 0.
+        assert_eq!(
+            t(1),
+            r#"
+                Disk[21]: Checksum { start: 0, end: 21, chunk_size_logarithm: 7, checksums.len(): 1 }
+                Disk[54]: Checksum { start: 0, end: 54, chunk_size_logarithm: 7, checksums.len(): 1 }
+                Disk[203]: Checksum { start: 0, end: 203, chunk_size_logarithm: 7, checksums.len(): 2 }
+                Disk[266]: Checksum { start: 0, end: 266, chunk_size_logarithm: 7, checksums.len(): 3 }
+                Disk[440]: Checksum { start: 0, end: 440, chunk_size_logarithm: 7, checksums.len(): 4 }
+                Disk[521]: Checksum { start: 0, end: 521, chunk_size_logarithm: 7, checksums.len(): 5 }
+                Disk[616]: Checksum { start: 0, end: 616, chunk_size_logarithm: 7, checksums.len(): 5 }
+                Disk[814]: Checksum { start: 0, end: 814, chunk_size_logarithm: 7, checksums.len(): 7 }
+                Disk[933]: Checksum { start: 0, end: 933, chunk_size_logarithm: 7, checksums.len(): 8 }
+                Disk[1058]: Checksum { start: 0, end: 1058, chunk_size_logarithm: 7, checksums.len(): 9 }
+                Disk[1296]: Checksum { start: 0, end: 1296, chunk_size_logarithm: 7, checksums.len(): 11 }
+                Disk[1455]: Checksum { start: 0, end: 1455, chunk_size_logarithm: 7, checksums.len(): 12 }
+                Disk[1725]: Checksum { start: 0, end: 1725, chunk_size_logarithm: 7, checksums.len(): 14 }"#
+        );
+    }
+
     #[test]
     fn test_root_meta() {
         let dir = tempdir().unwrap();
@@ -4405,7 +4642,7 @@ Disk[410]: Root { radix: Disk[402] }
         let mut variant_keys = Vec::new();
         for base_key in keys.iter() {
             // One byte appended
-            for b in [0x00, 0x77, 0xff].iter().cloned() {
+            for b in [0x00, 0x77, 0xff] {
                 let mut key = base_key.to_vec();
                 key.push(b);
                 variant_keys.push(key);

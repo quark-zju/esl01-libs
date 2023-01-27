@@ -1,16 +1,18 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
-use crate::errors::IoResultExt;
-use crate::lock::ScopedDirLock;
-use crate::log::{LogMetadata, META_FILE};
-use crate::utils;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
+
+use crate::lock::ScopedDirLock;
+use crate::log::LogMetadata;
+use crate::log::META_FILE;
+use crate::utils;
 
 /// Abstract Path for [`Log`].
 ///
@@ -93,10 +95,21 @@ impl GenericPath {
         match self {
             GenericPath::Filesystem(dir) => {
                 let meta_path = dir.join(META_FILE);
-                LogMetadata::read_file(&meta_path).context(&meta_path, "when reading LogMetadata")
+                LogMetadata::read_file(&meta_path)
             }
-            GenericPath::SharedMeta { meta, .. } => {
+            GenericPath::SharedMeta { meta, path } => {
                 let meta = meta.lock().unwrap();
+                if let GenericPath::Filesystem(dir) = path.as_ref() {
+                    let meta_path = dir.join(META_FILE);
+                    if let Ok(on_disk_meta) = LogMetadata::read_file(&meta_path) {
+                        // Prefer the per-log "meta" if it is compatible with the multi-meta.
+                        // The per-log meta might contain more up-to-date information about
+                        // indexes, etc.
+                        if meta.is_compatible_with(&on_disk_meta) {
+                            return Ok(on_disk_meta);
+                        }
+                    }
+                }
                 Ok(meta.clone())
             }
             GenericPath::Nothing => Err(crate::Error::programming(
@@ -113,8 +126,16 @@ impl GenericPath {
                 Ok(())
             }
             GenericPath::SharedMeta {
-                meta: shared_meta, ..
+                meta: shared_meta,
+                path,
             } => {
+                // Update the per-log "meta" file. This can be useful for
+                // picking up new indexes (see test_new_index_built_only_once),
+                // or log internal data investigation.
+                if let GenericPath::Filesystem(dir) = path.as_ref() {
+                    let meta_path = dir.join(META_FILE);
+                    meta.write_file(&meta_path, fsync)?;
+                }
                 let mut shared_meta = shared_meta.lock().unwrap();
                 *shared_meta = meta.clone();
                 Ok(())

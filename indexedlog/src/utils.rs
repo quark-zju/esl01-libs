@@ -1,22 +1,28 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
-use std::{
-    fs::{self, File},
-    hash::Hasher,
-    io::{self, Read, Write},
-    path::Path,
-    sync::atomic::{self, AtomicI64},
-};
+use std::cell::RefCell;
+use std::fs;
+use std::fs::File;
+use std::hash::Hasher;
+use std::io;
+use std::io::Read;
+use std::io::Write;
+use std::path::Path;
+use std::sync::atomic;
 
-use crate::errors::{IoResultExt, ResultExt};
 use memmap::MmapOptions;
 use minibytes::Bytes;
-use twox_hash::{XxHash, XxHash32};
+use twox_hash::XxHash;
+use twox_hash::XxHash32;
+
+use crate::config;
+use crate::errors::IoResultExt;
+use crate::errors::ResultExt;
 
 /// Return a read-only view of the entire file.
 ///
@@ -138,7 +144,7 @@ pub fn atomic_write(
         // In theory the non-symlink approach (open, write, rename, close)
         // should also result in a non-empty file. However, we have seen empty
         // files sometimes without OS crashes (see https://fburl.com/bky2zu9e).
-        if SYMLINK_ATOMIC_WRITE.load(atomic::Ordering::SeqCst) {
+        if config::SYMLINK_ATOMIC_WRITE.load(atomic::Ordering::SeqCst) {
             if atomic_write_symlink(path, content).is_ok() {
                 return Ok(());
             }
@@ -151,46 +157,17 @@ pub fn atomic_write(
 /// Use a plain file. Do not use symlinks.
 pub fn atomic_write_plain(path: &Path, content: &[u8], fsync: bool) -> crate::Result<()> {
     let result: crate::Result<_> = {
-        let dir = path.parent().expect("path has a parent");
-        let mut file =
-            tempfile::NamedTempFile::new_in(dir).context(&dir, "cannot create tempfile")?;
-        file.as_file_mut()
-            .write_all(content)
-            .context(&file.path(), "cannot write to tempfile")?;
-        if fsync {
-            file.as_file_mut()
-                .sync_data()
-                .context(&file.path(), "cannot fdatasync")?;
-        }
-        // fix_perm issues are not fatal
-        let _ = fix_perm_file(file.as_file(), false);
-        let retry_limit = if cfg!(windows) { 5u16 } else { 0 };
-        let mut retry = 0;
-        let persisted = loop {
-            match file.persist(path) {
-                Ok(f) => break f,
-                Err(e) => {
-                    if retry < retry_limit && e.error.kind() == io::ErrorKind::PermissionDenied {
-                        // Windows - rename can fail with "Access Denied" randomly.
-                        // Retry a few times.
-                        tracing::info!(
-                            name = "atomic_write rename failed with EPERM. Will retry.",
-                            retry = retry,
-                            path = AsRef::<str>::as_ref(&path.display().to_string()),
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(1 << retry));
-                        retry += 1;
-                        file = e.file;
-                        continue;
-                    } else {
-                        return Err(crate::Error::wrap(Box::new(e), "cannot persist"));
-                    }
-                }
-            }
-        };
-        if fsync {
-            persisted.sync_all().context(path, "cannot fsync")?;
-        }
+        atomicfile::atomic_write(
+            path,
+            config::CHMOD_FILE.load(atomic::Ordering::SeqCst) as u32,
+            fsync || config::get_global_fsync(),
+            |file| {
+                file.write_all(content)?;
+                Ok(())
+            },
+        )
+        .context(path, "atomic_write error")?;
+
         Ok(())
     };
     result.context(|| {
@@ -278,18 +255,6 @@ fn atomic_read_symlink(path: &Path) -> io::Result<Vec<u8>> {
         Ok(encoded_content.to_vec())
     }
 }
-
-/// If set to true, prefer symlinks to normal files for atomic_write.
-pub static SYMLINK_ATOMIC_WRITE: atomic::AtomicBool = atomic::AtomicBool::new(cfg!(test));
-
-/// Default chmod mode for directories.
-/// u: rwx g:rws o:r-x
-pub static CHMOD_DIR: AtomicI64 = AtomicI64::new(0o2775);
-
-// XXX: This works around https://github.com/Stebalien/tempfile/pull/61.
-/// Default chmod mode for atomic_write files.
-pub static CHMOD_FILE: AtomicI64 = AtomicI64::new(0o664);
-
 /// Similar to `fs::create_dir_all`, but also attempts to chmod
 /// newly created directories on Unix.
 pub(crate) fn mkdir_p(dir: impl AsRef<Path>) -> crate::Result<()> {
@@ -327,7 +292,7 @@ pub(crate) fn mkdir_p(dir: impl AsRef<Path>) -> crate::Result<()> {
                         }
                     }
                 }
-                _ => (),
+                _ => {}
             }
             Err(err).context(dir, "cannot mkdir")
         })
@@ -354,9 +319,9 @@ pub(crate) fn fix_perm_file(file: &File, is_dir: bool) -> io::Result<()> {
     {
         // chmod
         let mode = if is_dir {
-            CHMOD_DIR.load(atomic::Ordering::SeqCst)
+            config::CHMOD_DIR.load(atomic::Ordering::SeqCst)
         } else {
-            CHMOD_FILE.load(atomic::Ordering::SeqCst)
+            config::CHMOD_FILE.load(atomic::Ordering::SeqCst)
         };
         if mode >= 0 {
             let perm = std::os::unix::fs::PermissionsExt::from_mode(mode as u32);
@@ -380,7 +345,7 @@ pub(crate) fn fix_perm_symlink(path: &Path) -> io::Result<()> {
         let path = CString::new(path.as_os_str().as_bytes())?;
 
         // chmod
-        let mode = CHMOD_FILE.load(atomic::Ordering::SeqCst);
+        let mode = config::CHMOD_FILE.load(atomic::Ordering::SeqCst);
         if mode >= 0 {
             unsafe {
                 libc::fchmodat(
@@ -399,10 +364,24 @@ pub(crate) fn fix_perm_symlink(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+thread_local! {
+    static THREAD_RAND_U64: RefCell<u64> = RefCell::new(0);
+}
+
 /// Return a value that is likely changing over time.
 /// This is used to detect non-append-only cases.
-pub(crate) fn epoch() -> u64 {
-    rand::random()
+pub(crate) fn rand_u64() -> u64 {
+    if cfg!(test) {
+        // For tests, generate different numbers each time.
+        let count = THREAD_RAND_U64.with(|i| {
+            *i.borrow_mut() += 1;
+            *i.borrow()
+        });
+        // Ensure the vlq representation is likely stable by setting a high bit.
+        count | (1u64 << 63)
+    } else {
+        rand::random()
+    }
 }
 
 #[cfg(test)]
@@ -410,7 +389,7 @@ mod tests {
     use super::*;
 
     fn check_atomic_read_write(data: &[u8]) {
-        SYMLINK_ATOMIC_WRITE.store(true, atomic::Ordering::SeqCst);
+        config::SYMLINK_ATOMIC_WRITE.store(true, atomic::Ordering::SeqCst);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a");
         let fsync = false;
@@ -433,9 +412,7 @@ mod tests {
             b"a\0b\0c\0",
             b"hex:a\0b\0c\0",
             b"\0\0\0\0\0\0",
-        ]
-        .iter()
-        {
+        ] {
             check_atomic_read_write(data);
         }
     }

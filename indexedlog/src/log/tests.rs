@@ -1,18 +1,20 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
-use super::*;
-use quickcheck::quickcheck;
 use std::cell::RefCell;
 #[cfg(not(windows))]
 use std::io::Read;
 #[cfg(not(windows))]
 use std::ops::Range;
+
+use quickcheck::quickcheck;
 use tempfile::tempdir;
+
+use super::*;
 
 #[derive(Debug)]
 struct DummyError(&'static str);
@@ -169,11 +171,12 @@ fn test_iter_and_iter_dirty() {
 
     log.sync().unwrap();
 
-    assert!(log
-        .iter_dirty()
-        .collect::<crate::Result<Vec<_>>>()
-        .unwrap()
-        .is_empty());
+    assert!(
+        log.iter_dirty()
+            .collect::<crate::Result<Vec<_>>>()
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         log.iter().collect::<crate::Result<Vec<_>>>().unwrap(),
         vec![b"2", b"4", b"3"]
@@ -324,7 +327,7 @@ fn test_index_manual() {
     // - Index key: Reference and Owned.
     // - Index lag_threshold: 0, 10, 20, ....
     // - Entries: Mixed on-disk and in-memory ones.
-    for lag in [0u64, 10, 20, 50, 1000].iter().cloned() {
+    for lag in [0u64, 10, 20, 50, 1000] {
         let dir = tempdir().unwrap();
         let mut log = Log::open(dir.path(), get_index_defs(lag)).unwrap();
         let entries: [&[u8]; 7] = [b"1", b"", b"2345", b"", b"78", b"3456", b"35"];
@@ -357,7 +360,7 @@ fn test_index_manual() {
 
         // Delete prefix.
         log.append(b"=3").unwrap();
-        for key in [b"34", b"35"].iter() {
+        for key in [b"34", b"35"] {
             assert!(log.lookup(0, key).unwrap().into_vec().unwrap().is_empty());
         }
         assert_eq!(log.lookup(0, b"56").unwrap().into_vec().unwrap(), [b"3456"]);
@@ -373,7 +376,7 @@ fn test_index_manual() {
                 log = Log::open(dir.path(), get_index_defs(lag)).unwrap();
             }
         }
-        for key in [b"34", b"56", b"78"].iter() {
+        for key in [b"34", b"56", b"78"] {
             assert!(log.lookup(0, key).unwrap().into_vec().unwrap().is_empty());
         }
         assert_eq!(log.lookup(1, b"345").unwrap().count(), 0);
@@ -825,12 +828,12 @@ fn test_sync_missing_meta() {
 
 fn test_rebuild_indexes() {
     let dir = tempdir().unwrap();
-    let open_opts = OpenOptions::new()
-        .create(true)
-        .index_defs(vec![IndexDef::new("key", |data| {
+    let open_opts = OpenOptions::new().create(true).index_defs(vec![
+        IndexDef::new("key", |data| {
             vec![IndexOutput::Reference(0..data.len() as u64)]
         })
-        .lag_threshold(1)]);
+        .lag_threshold(1),
+    ]);
     let mut log = open_opts.clone().open(dir.path()).unwrap();
 
     log.append(b"abc").unwrap();
@@ -893,7 +896,7 @@ fn test_rebuild_indexes() {
     assert_eq!(log.lookup(0, b"xyz").unwrap().count(), 0);
 }
 
-fn pwrite(path: &Path, offset: i64, data: &[u8]) {
+pub(crate) fn pwrite(path: &Path, offset: i64, data: &[u8]) {
     let mut file = fs::OpenOptions::new()
         .write(true)
         .read(true)
@@ -959,6 +962,43 @@ fn test_repair() {
 }
 
 #[test]
+fn test_repair_on_open() {
+    use crate::OpenWithRepair;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path();
+    let opts = OpenOptions::new().create(true);
+
+    // Prepare some data.
+    let mut log = opts.open(path).unwrap();
+    log.append(b"abc").unwrap();
+    log.flush().unwrap();
+
+    // Corrupt the log by breaking the meta file.
+    let meta_path = path.join(META_FILE);
+    utils::atomic_write(meta_path, b"xxx", false).unwrap();
+
+    // Opening the log errors out.
+    opts.open(path).unwrap_err();
+
+    // Auto repair fails because it detects active reader.
+    opts.open_with_repair(path).unwrap_err();
+    opts.open(path).unwrap_err();
+
+    // Drop the active reader.
+    drop(log);
+
+    // Opening with auto repair succeeds.
+    let log = opts.open_with_repair(path).unwrap();
+
+    // Reading entries is fine.
+    assert_eq!(
+        log.iter().collect::<Result<Vec<_>, _>>().unwrap(),
+        vec![b"abc"]
+    );
+}
+
+#[test]
 fn test_repair_noop() {
     // Repair does nothing if the Log can be read out without issues.
     let dir = tempdir().unwrap();
@@ -978,12 +1018,9 @@ fn test_repair_noop() {
 fn test_repair_and_delete_content() {
     let dir = tempdir().unwrap();
     let path = dir.path();
-    let open_opts = OpenOptions::new()
-        .create(true)
-        .index_defs(vec![IndexDef::new("c", |_| {
-            vec![IndexOutput::Reference(0..1)]
-        })
-        .lag_threshold(5000)]);
+    let open_opts = OpenOptions::new().create(true).index_defs(vec![
+        IndexDef::new("c", |_| vec![IndexOutput::Reference(0..1)]).lag_threshold(5000),
+    ]);
 
     let long_lived_log = RefCell::new(open_opts.open(()).unwrap());
     let open = || open_opts.open(path);
@@ -1002,7 +1039,7 @@ fn test_repair_and_delete_content() {
         let log = open()?;
         let log_len = log.iter().collect::<Result<Vec<_>, _>>()?.len();
         let mut index_len = 0;
-        for key in [b"x", b"y", b"z"].iter() {
+        for key in [b"x", b"y", b"z"] {
             let iter = log.lookup(0, key)?;
             index_len += iter.into_vec()?.len();
         }
@@ -1021,10 +1058,10 @@ fn test_repair_and_delete_content() {
         // Check no SIGBUS
         let log = long_lived_log.borrow();
         match log.lookup(0, "z") {
-            Err(_) => (), // okay - not SIGBUS
+            Err(_) => {} // okay - not SIGBUS
             Ok(iter) => match iter.into_vec() {
-                Err(_) => (), // okay - not SIGBUS
-                Ok(_) => (),  // okay - not SIGBUS
+                Err(_) => {} // okay - not SIGBUS
+                Ok(_) => {}  // okay - not SIGBUS
             },
         }
         // Check 'sync' on a long-lived log will load the right data and
@@ -1040,6 +1077,7 @@ fn test_repair_and_delete_content() {
             .lines()
             // Remove 'Backed up' lines since they have dynamic file names.
             .filter(|l| !l.contains("Backed up"))
+            .filter(|l| !l.contains("Processing"))
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -1336,7 +1374,7 @@ fn test_non_append_only() {
     // This test requires renaming files while mmap is present. That
     // cannot be done in Windows.
     //
-    // This test should fail if utils::epoch returns a constant.
+    // This test should fail if utils::rand_u64 returns a constant.
     let dir = tempdir().unwrap();
 
     let indexes = vec![IndexDef::new("key1", index_ref).lag_threshold(1)];
@@ -1446,10 +1484,7 @@ fn test_multithread_sync() {
     const THREAD_COUNT: u8 = 30;
 
     // Release mode runs much faster.
-    #[cfg(debug_assertions)]
-    const WRITE_COUNT_PER_THREAD: u8 = 30;
-    #[cfg(not(debug_assertions))]
-    const WRITE_COUNT_PER_THREAD: u8 = 150;
+    const WRITE_COUNT_PER_THREAD: u8 = if cfg!(debug_assertions) { 30 } else { 150 };
 
     // Some indexes. They have different lag_threshold.
     fn index_copy(data: &[u8]) -> Vec<IndexOutput> {

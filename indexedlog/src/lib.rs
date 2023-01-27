@@ -1,8 +1,8 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 #![allow(dead_code)]
@@ -19,6 +19,7 @@
 mod macros;
 
 pub mod base16;
+pub mod config;
 mod errors;
 pub mod index;
 pub mod lock;
@@ -28,5 +29,11 @@ mod repair;
 pub mod rotate;
 pub mod utils;
 
-pub use errors::{Error, Result};
-pub use repair::{DefaultOpenOptions, Repair};
+pub use errors::Error;
+pub use errors::Result;
+pub use repair::DefaultOpenOptions;
+pub use repair::OpenWithRepair;
+pub use repair::Repair;
+
+#[cfg(test)]
+dev_logger::init!();

@@ -1,19 +1,29 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
+use std::borrow::Cow;
+use std::fmt;
+use std::fmt::Debug;
+use std::ops::Range;
+use std::sync::Arc;
+
+use tracing::debug_span;
+
+use super::fold::Fold;
+use super::fold::FoldDef;
+use super::fold::FoldState;
 use crate::errors::ResultExt;
 use crate::index::Index;
 use crate::lock::ScopedDirLock;
-use crate::log::{GenericPath, Log, LogMetadata, PRIMARY_START_OFFSET};
-use std::borrow::Cow;
-use std::fmt::{self, Debug};
-use std::ops::Range;
-
-use tracing::debug_span;
+use crate::lock::READER_LOCK_OPTS;
+use crate::log::GenericPath;
+use crate::log::Log;
+use crate::log::LogMetadata;
+use crate::log::PRIMARY_START_OFFSET;
 
 const INDEX_FILE_PREFIX: &str = "index2-";
 const META_PREFIX: &str = "2-";
@@ -40,7 +50,7 @@ pub struct IndexDef {
     /// This function gets the commit metadata as input. It then parses the
     /// input, and extract parent commit hashes as the output. A git commit can
     /// have 0 or 1 or 2 or even more parents. Therefore the output is a [`Vec`].
-    pub(crate) func: fn(&[u8]) -> Vec<IndexOutput>,
+    pub(crate) func: Arc<dyn Fn(&[u8]) -> Vec<IndexOutput> + Send + Sync + 'static>,
 
     /// Name of the index.
     ///
@@ -49,7 +59,7 @@ pub struct IndexDef {
     ///
     /// When adding new or changing index functions, make sure a different
     /// `name` is used so the existing index won't be reused incorrectly.
-    pub(crate) name: &'static str,
+    pub(crate) name: Arc<String>,
 
     /// How many bytes (as counted in the file backing [`Log`]) could be left not
     /// indexed on-disk.
@@ -110,6 +120,7 @@ pub enum ChecksumType {
 #[derive(Clone)]
 pub struct OpenOptions {
     pub(crate) index_defs: Vec<IndexDef>,
+    pub(crate) fold_defs: Vec<FoldDef>,
     pub(crate) create: bool,
     pub(crate) checksum_type: ChecksumType,
     pub(crate) flush_filter: Option<FlushFilterFunc>,
@@ -170,10 +181,13 @@ impl IndexDef {
     ///
     /// When adding new or changing index functions, make sure a different
     /// `name` is used so the existing index won't be reused incorrectly.
-    pub fn new(name: &'static str, index_func: fn(&[u8]) -> Vec<IndexOutput>) -> Self {
+    pub fn new(
+        name: impl ToString,
+        index_func: impl Fn(&[u8]) -> Vec<IndexOutput> + Send + Sync + 'static,
+    ) -> Self {
         Self {
-            func: index_func,
-            name,
+            func: Arc::new(index_func),
+            name: Arc::new(name.to_string()),
             // For a typical commit hash index (20-byte). IndexedLog insertion
             // overhead is about 1500 entries per millisecond. For other things
             // the xxhash check might take some time. 500 entries takes <1ms
@@ -226,6 +240,7 @@ impl OpenOptions {
         Self {
             create: false,
             index_defs: Vec::new(),
+            fold_defs: Vec::new(),
             checksum_type: ChecksumType::Auto,
             flush_filter: None,
             fsync: false,
@@ -248,6 +263,12 @@ impl OpenOptions {
     /// explicitly.
     pub fn index(mut self, name: &'static str, func: fn(&[u8]) -> Vec<IndexOutput>) -> Self {
         self.index_defs.push(IndexDef::new(name, func));
+        self
+    }
+
+    /// Add a "fold" definition. See [`FoldDef`] and [`Fold`] for details.
+    pub fn fold_def(mut self, name: &'static str, create_fold: fn() -> Box<dyn Fold>) -> Self {
+        self.fold_defs.push(FoldDef::new(name, create_fold));
         self
     }
 
@@ -359,14 +380,19 @@ impl OpenOptions {
                 None,
                 self.fsync,
             )?;
+            let disk_folds = self.empty_folds();
+            let all_folds = disk_folds.clone();
             Ok(Log {
                 dir,
                 disk_buf,
                 mem_buf,
                 meta,
                 indexes,
+                disk_folds,
+                all_folds,
                 index_corrupted: false,
                 open_options: self.clone(),
+                reader_lock: None,
             })
         })();
 
@@ -390,6 +416,10 @@ impl OpenOptions {
         reuse_indexes: Option<&Vec<Index>>,
         lock: Option<&ScopedDirLock>,
     ) -> crate::Result<Log> {
+        let reader_lock = match dir.as_opt_path() {
+            Some(d) => Some(ScopedDirLock::new_with_options(d, &READER_LOCK_OPTS)?),
+            None => None,
+        };
         let create = self.create;
 
         // Do a lock-less load_or_create_meta to avoid the flock overhead.
@@ -419,16 +449,23 @@ impl OpenOptions {
             reuse_indexes,
             self.fsync,
         )?;
+        let disk_folds = self.empty_folds();
+        let all_folds = disk_folds.clone();
         let mut log = Log {
             dir: dir.clone(),
             disk_buf,
             mem_buf,
             meta,
             indexes,
+            disk_folds,
+            all_folds,
             index_corrupted: false,
             open_options: self.clone(),
+            reader_lock,
         };
         log.update_indexes_for_on_disk_entries()?;
+        log.update_and_flush_disk_folds()?;
+        log.all_folds = log.disk_folds.clone();
         let lagging_index_ids = log.lagging_index_ids();
         if !lagging_index_ids.is_empty() {
             // Update indexes.
@@ -444,6 +481,10 @@ impl OpenOptions {
             }
         }
         Ok(log)
+    }
+
+    pub(crate) fn empty_folds(&self) -> Vec<FoldState> {
+        self.fold_defs.iter().map(|def| def.empty_state()).collect()
     }
 }
 
@@ -471,7 +512,7 @@ impl IndexOutput {
             IndexOutput::Remove(_) | IndexOutput::RemovePrefix(_) => {
                 return Err(crate::Error::programming(
                     "into_cow does not support Remove or RemovePrefix",
-                ))
+                ));
             }
         })
     }
@@ -483,7 +524,15 @@ impl fmt::Debug for OpenOptions {
         write!(
             f,
             "index_defs: {:?}, ",
-            self.index_defs.iter().map(|d| d.name).collect::<Vec<_>>()
+            self.index_defs
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>()
+        )?;
+        write!(
+            f,
+            "fold_defs: {:?}, ",
+            self.fold_defs.iter().map(|d| d.name).collect::<Vec<_>>()
         )?;
         write!(f, "fsync: {}, ", self.fsync)?;
         write!(f, "create: {}, ", self.create)?;

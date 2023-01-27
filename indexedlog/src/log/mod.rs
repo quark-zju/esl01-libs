@@ -1,8 +1,8 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 //! Append-only storage with indexes and integrity checks.
@@ -33,37 +33,68 @@
 // Integers are VLQ encoded, except for XXHASH64 and XXHASH32, which uses
 // LittleEndian encoding.
 
-use crate::errors::{IoResultExt, ResultExt};
-use crate::index::{self, Index, InsertKey, InsertValue, LeafValueIter, RangeIter, ReadonlyBuffer};
-use crate::lock::ScopedDirLock;
-use crate::utils::{self, mmap_path, xxhash, xxhash32};
-use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
-use minibytes::Bytes;
 use std::borrow::Cow;
-use std::fmt::{self, Debug, Formatter};
-use std::fs::{self, File};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::fs;
+use std::fs::File;
+use std::io;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::io::Write;
 use std::ops::RangeBounds;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+
+use byteorder::ByteOrder;
+use byteorder::LittleEndian;
+use byteorder::WriteBytesExt;
+use minibytes::Bytes;
 use tracing::debug_span;
 use tracing::trace;
-use vlqencoding::{VLQDecodeAt, VLQEncode};
+use vlqencoding::VLQDecodeAt;
+use vlqencoding::VLQEncode;
 
+use crate::config;
+use crate::errors::IoResultExt;
+use crate::errors::ResultExt;
+use crate::index;
+use crate::index::Index;
+use crate::index::InsertKey;
+use crate::index::InsertValue;
+use crate::index::LeafValueIter;
+use crate::index::RangeIter;
+use crate::index::ReadonlyBuffer;
+use crate::lock::ScopedDirLock;
+use crate::lock::READER_LOCK_OPTS;
+use crate::utils;
+use crate::utils::mmap_path;
+use crate::utils::xxhash;
+use crate::utils::xxhash32;
+
+mod fold;
 mod meta;
 mod open_options;
 mod path;
 mod repair;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
-pub use self::meta::LogMetadata;
-pub use open_options::{
-    ChecksumType, FlushFilterContext, FlushFilterFunc, FlushFilterOutput, IndexDef, IndexOutput,
-    OpenOptions,
-};
+pub use open_options::ChecksumType;
+pub use open_options::FlushFilterContext;
+pub use open_options::FlushFilterFunc;
+pub use open_options::FlushFilterOutput;
+pub use open_options::IndexDef;
+pub use open_options::IndexOutput;
+pub use open_options::OpenOptions;
 pub use path::GenericPath;
+
+pub use self::fold::Fold;
+pub use self::fold::FoldDef;
+use self::fold::FoldState;
+pub use self::meta::LogMetadata;
 
 // Constants about file names
 pub(crate) const PRIMARY_FILE: &str = "log";
@@ -96,16 +127,23 @@ const INDEX_CHECKSUM_CHUNK_SIZE_LOGARITHM: u32 = 20;
 /// disk requires taking a flock on the directory.
 pub struct Log {
     pub dir: GenericPath,
-    disk_buf: Bytes,
+    pub(crate) disk_buf: Bytes,
     pub(crate) mem_buf: Pin<Box<Vec<u8>>>,
-    meta: LogMetadata,
+    pub(crate) meta: LogMetadata,
     indexes: Vec<Index>,
+    // On-demand caches of the folds defined by open_options.
+    // disk_folds only includes clean (on-disk) entries.
+    // all_folds includes both clean (on-disk) and dirty (in-memory) entries.
+    disk_folds: Vec<FoldState>,
+    all_folds: Vec<FoldState>,
     // Whether the index and the log is out-of-sync. In which case, index-based reads (lookups)
     // should return errors because it can no longer be trusted.
     // This could be improved to be per index. For now, it's a single state for simplicity. It's
     // probably fine considering index corruptions are rare.
     index_corrupted: bool,
     open_options: OpenOptions,
+    // Indicate an active reader. Destrictive writes (repair) are unsafe.
+    reader_lock: Option<ScopedDirLock>,
 }
 
 /// Iterator over all entries in a [`Log`].
@@ -274,6 +312,7 @@ impl Log {
 
             self.mem_buf.write_all(data).infallible()?;
             self.update_indexes_for_in_memory_entry(data, offset, data_offset)?;
+            self.update_fold_for_in_memory_entry(data, offset, data_offset)?;
 
             if let Some(threshold) = self.open_options.auto_sync_threshold {
                 if self.mem_buf.len() as u64 >= threshold {
@@ -306,6 +345,7 @@ impl Log {
                 index.clear_dirty();
             }
             self.mem_buf.clear();
+            self.all_folds = self.disk_folds.clone();
             self.update_indexes_for_on_disk_entries()?;
             Ok(())
         })();
@@ -360,6 +400,11 @@ impl Log {
             }
         }
 
+        let reader_lock = match self.dir.as_opt_path() {
+            Some(d) => Some(ScopedDirLock::new_with_options(d, &READER_LOCK_OPTS)?),
+            None => None,
+        };
+
         // Create the new Log.
         let mut log = Log {
             dir: self.dir.clone(),
@@ -367,8 +412,16 @@ impl Log {
             mem_buf,
             meta: self.meta.clone(),
             indexes,
+            disk_folds: self.disk_folds.clone(),
+            all_folds: if copy_dirty {
+                &self.all_folds
+            } else {
+                &self.disk_folds
+            }
+            .clone(),
             index_corrupted: false,
             open_options: self.open_options.clone(),
+            reader_lock,
         };
 
         if !copy_dirty {
@@ -411,10 +464,13 @@ impl Log {
             fn check_append_only(this: &Log, new_meta: &LogMetadata) -> crate::Result<()> {
                 let old_meta = &this.meta;
                 if old_meta.primary_len > new_meta.primary_len {
-                    Err(crate::Error::path(this.dir.as_opt_path().unwrap(), format!(
-                    "on-disk log is unexpectedly smaller ({} bytes) than its previous version ({} bytes)",
-                    new_meta.primary_len, old_meta.primary_len
-                )))
+                    Err(crate::Error::path(
+                        this.dir.as_opt_path().unwrap(),
+                        format!(
+                            "on-disk log is unexpectedly smaller ({} bytes) than its previous version ({} bytes)",
+                            new_meta.primary_len, old_meta.primary_len
+                        ),
+                    ))
                 } else {
                     Ok(())
                 }
@@ -483,7 +539,7 @@ impl Log {
                     match filter(&context, content)
                         .map_err(|err| crate::Error::wrap(err, "failed to run filter function"))?
                     {
-                        FlushFilterOutput::Drop => (),
+                        FlushFilterOutput::Drop => {}
                         FlushFilterOutput::Keep => log.append(content)?,
                         FlushFilterOutput::Replace(content) => log.append(content)?,
                     }
@@ -557,7 +613,7 @@ impl Log {
                     format!("cannot write data ({} bytes)", self.mem_buf.len())
                 })?;
 
-            if self.open_options.fsync {
+            if self.open_options.fsync || config::get_global_fsync() {
                 primary_file
                     .sync_all()
                     .context(&primary_path, "cannot fsync")?;
@@ -598,10 +654,12 @@ impl Log {
             self.indexes = indexes;
             self.meta = meta;
 
-            // Step 4: Update the indexes. Optionally flush them.
+            // Step 4: Update the indexes and folds. Optionally flush them.
             self.update_indexes_for_on_disk_entries()?;
             let lagging_index_ids = self.lagging_index_ids();
             self.flush_lagging_indexes(&lagging_index_ids, &lock)?;
+            self.update_and_flush_disk_folds()?;
+            self.all_folds = self.disk_folds.clone();
 
             // Step 5: Write the updated meta file.
             self.dir.write_meta(&self.meta, self.open_options.fsync)?;
@@ -630,7 +688,7 @@ impl Log {
             self.meta.indexes.insert(metaname, new_length);
             trace!(
                 name = "Log::flush_lagging_index",
-                index_name = self.open_options.index_defs[index_id].name,
+                index_name = self.open_options.index_defs[index_id].name.as_str(),
                 new_index_length = new_length,
             );
         }
@@ -651,7 +709,7 @@ impl Log {
                 let lag_threshold = def.lag_threshold;
                 trace!(
                     name = "Log::is_index_lagging",
-                    index_name = def.name,
+                    index_name = def.name.as_str(),
                     lag = lag_bytes,
                     threshold = lag_threshold
                 );
@@ -690,8 +748,8 @@ impl Log {
     /// of `lag_threshold`.
     ///
     /// This is used internally by [`RotateLog`] to make sure a [`Log`] has
-    /// complate indexes before rotating.
-    pub(crate) fn finalize_indexes(&mut self) -> crate::Result<()> {
+    /// complete indexes before rotating.
+    pub(crate) fn finalize_indexes(&mut self, _lock: &ScopedDirLock) -> crate::Result<()> {
         let result: crate::Result<_> = (|| {
             let dir = self.dir.clone();
             if let Some(dir) = dir.as_opt_path() {
@@ -704,11 +762,28 @@ impl Log {
                 let _lock = ScopedDirLock::new(&dir)?;
 
                 let meta = Self::load_or_create_meta(&self.dir, false)?;
-                if self.meta != meta {
-                    return Err(crate::Error::programming(
-                        "race detected, callsite responsible for preventing races",
-                    ));
+                // Only check primary_len, not meta.indexes. This is because
+                // meta.indexes can be updated on open. See D38261693 (test)
+                // and D20042046 (update index on open).
+                //
+                // More details:
+                // For RotateLog it has 2 levels of directories and locks, like:
+                // - rotate/lock: lock when RotateLog is writing
+                // - rotate/0/: Previous (considered by RotateLog as read-only) Log
+                // - rotate/1/: Previous (considered by RotateLog as read-only) Log
+                // - rotate/2/lock: lock when this Log is being written
+                // - rotate/2/: "Current" (writable) Log
+                //
+                // However, when opening rotate/0 as a Log, it might change the indexes
+                // without being noticed by other RotateLogs. If the indexes are updated,
+                // then the meta would be changed. The primary len is not changed, though.
+                if self.meta.primary_len != meta.primary_len || self.meta.epoch != meta.epoch {
+                    return Err(crate::Error::programming(format!(
+                        "race detected, callsite responsible for preventing races (old meta: {:?}, new meta: {:?})",
+                        &self.meta, &meta
+                    )));
                 }
+                self.meta = meta;
 
                 // Flush all indexes.
                 for i in 0..self.indexes.len() {
@@ -764,7 +839,7 @@ impl Log {
         {
             if let Some(ref dir) = self.dir.as_opt_path() {
                 for (i, def) in self.open_options.index_defs.iter().enumerate() {
-                    let name = def.name;
+                    let name = def.name.as_str();
 
                     if let Some(index) = &self.indexes.get(i) {
                         let should_skip = if force {
@@ -1010,6 +1085,28 @@ impl Log {
         Ok(result)
     }
 
+    /// Return the fold state after calling `accumulate` on all (on-disk and
+    /// in-memory) entries in insertion order.
+    ///
+    /// The fold function is the `fold_id`-th (0-based) `FoldDef` in
+    /// [`OpenOptions`].
+    pub fn fold(&self, fold_id: usize) -> crate::Result<&dyn Fold> {
+        match self.all_folds.get(fold_id) {
+            Some(f) => Ok(f.fold.as_ref()),
+            None => Err(self.fold_out_of_bound(fold_id)),
+        }
+    }
+
+    fn fold_out_of_bound(&self, fold_id: usize) -> crate::Error {
+        let msg = format!(
+            "fold_id {} is out of bound (len={}, dir={:?})",
+            fold_id,
+            self.open_options.fold_defs.len(),
+            &self.dir
+        );
+        crate::Error::programming(msg)
+    }
+
     /// Build in-memory index for the newly added entry.
     ///
     /// `offset` is the logical start offset of the entry.
@@ -1023,6 +1120,19 @@ impl Log {
     ) -> crate::Result<()> {
         let result = self.update_indexes_for_in_memory_entry_unchecked(data, offset, data_offset);
         self.maybe_set_index_error(result)
+    }
+
+    /// Similar to `update_indexes_for_in_memory_entry`. But updates `fold` instead.
+    fn update_fold_for_in_memory_entry(
+        &mut self,
+        data: &[u8],
+        offset: u64,
+        data_offset: u64,
+    ) -> crate::Result<()> {
+        for fold_state in self.all_folds.iter_mut() {
+            fold_state.process_entry(data, offset, data_offset + data.len() as u64)?;
+        }
+        Ok(())
     }
 
     fn update_indexes_for_in_memory_entry_unchecked(
@@ -1055,6 +1165,25 @@ impl Log {
             }
         }
         Ok(())
+    }
+
+    /// Incrementally update `disk_folds`.
+    ///
+    /// This is done by trying to reuse fold states from disk.
+    /// If the on-disk fold state is outdated, then new fold states will be
+    /// written to disk.
+    fn update_and_flush_disk_folds(&mut self) -> crate::Result<()> {
+        let mut folds = self.open_options.empty_folds();
+        // Temporarily swap so `catch_up_with_log_on_disk_entries` can access `self`.
+        std::mem::swap(&mut self.disk_folds, &mut folds);
+        let result = (|| -> crate::Result<()> {
+            for fold_state in folds.iter_mut() {
+                fold_state.catch_up_with_log_on_disk_entries(self)?;
+            }
+            Ok(())
+        })();
+        self.disk_folds = folds;
+        result
     }
 
     /// Build in-memory index so they cover all entries stored in `self.disk_buf`.
@@ -1140,18 +1269,12 @@ impl Log {
         path: &GenericPath,
         create: bool,
     ) -> crate::Result<LogMetadata> {
-        Self::load_or_create_meta_internal(path, create, false)
-    }
-
-    /// Used by MultiLog. Write a dummy "meta" file that prevents accidental reading.
-    pub(crate) fn load_or_create_shared_meta(path: &GenericPath) -> crate::Result<LogMetadata> {
-        Self::load_or_create_meta_internal(path, true, true)
+        Self::load_or_create_meta_internal(path, create)
     }
 
     pub(crate) fn load_or_create_meta_internal(
         path: &GenericPath,
         create: bool,
-        is_shared: bool,
     ) -> crate::Result<LogMetadata> {
         match path.read_meta() {
             Err(err) => {
@@ -1169,25 +1292,6 @@ impl Log {
                     let meta = LogMetadata::new_with_primary_len(PRIMARY_START_OFFSET);
                     // An empty meta file is easy to recreate. No need to use fsync.
                     path.write_meta(&meta, false)?;
-                    if is_shared {
-                        // If meta is intended to be shared, write a poisoned one to the
-                        // filesystem to prevent loading. But return the clean one.
-                        // The filesystem layout looks like:
-                        // - multilog/this-log/meta # poisoned
-                        // - multilog/multimeta     # the right one to use
-                        let poisoned_meta = LogMetadata::new_poisoned(
-                            "This Log is managed by MultiLog. Direct access is forbidden!",
-                        );
-                        if let GenericPath::SharedMeta { .. } = path {
-                            // This path being poisoned should be the path being wrapped in
-                            // a `GenericPath::SharedMeta`, not the shared path itself.
-                            panic!("bug: GenericPath::SharedMeta shouldn't be used here.");
-                        }
-                        path.write_meta(&poisoned_meta, false)?;
-                    } else {
-                        // An empty meta file is easy to recreate. No need to use fsync.
-                        path.write_meta(&meta, false)?;
-                    }
                     Ok(meta)
                 } else {
                     Err(err)
@@ -1327,14 +1431,15 @@ impl Log {
             }
         };
 
-        use std::cmp::Ordering::{Equal, Greater};
+        use std::cmp::Ordering::Equal;
+        use std::cmp::Ordering::Greater;
         match offset.cmp(&(buf.len() as u64)) {
             Equal => return Ok(None),
             Greater => {
                 let msg = format!("read offset {} exceeds buffer size {}", offset, buf.len());
                 return Err(data_error(msg));
             }
-            _ => (),
+            _ => {}
         }
 
         let (entry_flags, vlq_len): (u32, _) = buf.read_vlq_at(offset as usize).map_err(|e| {
@@ -1688,15 +1793,15 @@ impl Debug for Log {
 
 impl ReadonlyBuffer for ExternalKeyBuffer {
     #[inline]
-    fn slice(&self, start: u64, len: u64) -> &[u8] {
+    fn slice(&self, start: u64, len: u64) -> Option<&[u8]> {
         if start < self.disk_len {
-            &self.disk_buf[(start as usize)..(start + len) as usize]
+            self.disk_buf.get((start as usize)..(start + len) as usize)
         } else {
             let start = start - self.disk_len;
             // See "UNSAFE NOTICE" in ExternalKeyBuffer definition.
             // This pointer cannot be null.
             let mem_buf = unsafe { &*self.mem_buf };
-            &mem_buf[(start as usize)..(start + len) as usize]
+            mem_buf.get((start as usize)..(start + len) as usize)
         }
     }
 }

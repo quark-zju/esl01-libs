@@ -1,8 +1,8 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 //! Base16 iterator.
@@ -128,8 +128,9 @@ pub(crate) fn single_hex_to_base16(ch: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use quickcheck::quickcheck;
+
+    use super::*;
 
     quickcheck! {
         fn check_skip_rev(src: Vec<u8>) -> bool {
@@ -139,8 +140,7 @@ mod tests {
             (0..full.len()).all(|i| {
                 let v: Vec<u8> = iter.clone().skip(i).collect();
                 let r: Vec<u8> = iter.clone().skip(i).rev().rev().rev().collect();
-                v.capacity() == v.len() && v[..] == full[i..] &&
-                    r.capacity() == r.len() && r[..] == rev[..(rev.len() - i)]
+                v[..] == full[i..] && r[..] == rev[..(rev.len() - i)]
             })
         }
 
@@ -171,7 +171,6 @@ mod tests {
         let x = [0x12, 0x34, 0x56u8];
         let i = Base16Iter::from_base256(&x).skip(3).take(3).rev(); // .rev() works directly
         let v: Vec<u8> = i.collect();
-        assert_eq!(v.capacity(), v.len());
         assert_eq!(v, vec![6, 5, 4]);
     }
 }

@@ -1,21 +1,35 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
-use crate::errors::{IoResultExt, ResultExt};
-use crate::lock::ScopedDirLock;
-use crate::log::{
-    GenericPath, LogMetadata, OpenOptions, META_FILE, PRIMARY_FILE, PRIMARY_HEADER,
-    PRIMARY_START_OFFSET,
-};
-use crate::repair::OpenOptionsRepair;
-use crate::utils::{self, mmap_path};
-use std::fs::{self};
-use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
+use std::fs;
+use std::io;
+use std::io::BufRead;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::io::Write;
 use std::path::Path;
+
+use crate::errors::IoResultExt;
+use crate::errors::ResultExt;
+use crate::lock::ScopedDirLock;
+use crate::log::GenericPath;
+use crate::log::Log;
+use crate::log::LogMetadata;
+use crate::log::OpenOptions;
+use crate::log::META_FILE;
+use crate::log::PRIMARY_FILE;
+use crate::log::PRIMARY_HEADER;
+use crate::log::PRIMARY_START_OFFSET;
+use crate::repair::OpenOptionsOutput;
+use crate::repair::OpenOptionsRepair;
+use crate::repair::RepairMessage;
+use crate::utils;
+use crate::utils::mmap_path;
 
 // Repair
 impl OpenOptions {
@@ -29,8 +43,6 @@ impl OpenOptions {
     /// Return message useful for human consumption.
     pub fn repair(&self, dir: impl Into<GenericPath>) -> crate::Result<String> {
         let dir = dir.into();
-        let mut message = String::new();
-
         let dir = match dir.as_opt_path() {
             Some(dir) => dir,
             None => return Ok(format!("{:?} is not on disk. Nothing to repair.\n", &dir)),
@@ -42,6 +54,8 @@ impl OpenOptions {
             }
 
             let lock = ScopedDirLock::new(dir)?;
+            let mut message = RepairMessage::new(dir);
+            message += &format!("Processing IndexedLog: {:?}\n", dir);
 
             let primary_path = dir.join(PRIMARY_FILE);
             let meta_path = dir.join(META_FILE);
@@ -87,7 +101,6 @@ impl OpenOptions {
                     .context(&primary_path, "cannot read fs metadata")?
                     .len();
                 match LogMetadata::read_file(&meta_path)
-                    .context(&meta_path, "cannot read log metadata")
                     .context("repair cannot fix metadata corruption")
                 {
                     Ok(meta) => {
@@ -221,7 +234,7 @@ impl OpenOptions {
                 .rebuild_indexes_with_lock(false, &lock)
                 .context("while trying to update indexes with reapired log")?;
 
-            Ok(message)
+            Ok(message.into_string())
         })();
 
         result.context(|| format!("in log::OpenOptions::repair({:?})", dir))
@@ -231,6 +244,14 @@ impl OpenOptions {
 impl OpenOptionsRepair for OpenOptions {
     fn open_options_repair(&self, dir: impl AsRef<Path>) -> crate::Result<String> {
         OpenOptions::repair(self, dir.as_ref())
+    }
+}
+
+impl OpenOptionsOutput for OpenOptions {
+    type Output = Log;
+
+    fn open_path(&self, path: &Path) -> crate::Result<Self::Output> {
+        self.open(path)
     }
 }
 

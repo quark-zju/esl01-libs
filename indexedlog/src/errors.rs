@@ -1,8 +1,8 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 //! Errors used by the crate
@@ -79,7 +79,7 @@ impl Error {
         self.inner.is_corruption
     }
 
-    pub(crate) fn io_error_kind(&self) -> io::ErrorKind {
+    pub fn io_error_kind(&self) -> io::ErrorKind {
         self.inner.io_error_kind.unwrap_or(io::ErrorKind::Other)
     }
 
@@ -410,12 +410,16 @@ Caused by 2 errors:
     fn test_inherit_corruption() {
         assert!(!Error::blank().is_corruption());
         assert!(!Error::blank().source(Error::blank()).is_corruption());
-        assert!(Error::blank()
-            .source(Error::blank().mark_corruption())
-            .is_corruption());
-        assert!(Error::blank()
-            .source(Error::blank().source(Error::blank().mark_corruption()))
-            .is_corruption());
+        assert!(
+            Error::blank()
+                .source(Error::blank().mark_corruption())
+                .is_corruption()
+        );
+        assert!(
+            Error::blank()
+                .source(Error::blank().source(Error::blank().mark_corruption()))
+                .is_corruption()
+        );
     }
 
     #[test]
