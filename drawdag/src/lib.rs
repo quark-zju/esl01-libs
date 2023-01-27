@@ -1,15 +1,19 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 //! # drawdag
 //!
 //! Utilities to parse ASCII revision DAG and create commits from them.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::collections::HashSet;
+
+mod succ;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Direction {
@@ -53,20 +57,17 @@ enum Direction {
 /// "#);
 /// assert_eq!(format!("{:?}", edges), expected);
 /// ```
-pub fn parse(text: impl AsRef<str>) -> BTreeMap<String, BTreeSet<String>> {
-    use Direction::{BottomTop, LeftRight};
+pub fn parse(text: &str) -> BTreeMap<String, BTreeSet<String>> {
+    use Direction::BottomTop;
+    use Direction::LeftRight;
 
     // Detect direction.
-    let direction = if text.as_ref().contains('|') {
+    let direction = if "|:".chars().any(|c| text.contains(c)) {
         BottomTop
     } else {
         LeftRight
     };
-    let lines: Vec<Vec<char>> = text
-        .as_ref()
-        .lines()
-        .map(|line| line.chars().collect())
-        .collect();
+    let lines: Vec<Vec<char>> = text.lines().map(|line| line.chars().collect()).collect();
 
     // (y, x) -> char. Return a space if (y, x) is out of range.
     let get = |y: isize, x: isize| -> char {
@@ -76,8 +77,7 @@ pub fn parse(text: impl AsRef<str>) -> BTreeMap<String, BTreeSet<String>> {
             lines
                 .get(y as usize)
                 .cloned()
-                .map(|line| line.get(x as usize).cloned().unwrap_or(' '))
-                .unwrap_or(' ')
+                .map_or(' ', |line| line.get(x as usize).cloned().unwrap_or(' '))
         }
     };
 
@@ -86,73 +86,113 @@ pub fn parse(text: impl AsRef<str>) -> BTreeMap<String, BTreeSet<String>> {
         (0..x)
             .rev()
             .map(|x| get(y, x))
-            .take_while(|&ch| is_name(ch))
+            .take_while(|&ch| is_name(ch, direction))
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
-            .chain((x..).map(|x| get(y, x)).take_while(|&ch| is_name(ch)))
+            .chain(
+                (x..)
+                    .map(|x| get(y, x))
+                    .take_while(|&ch| is_name(ch, direction)),
+            )
             .collect()
     };
 
+    /// State used to visit the graph.
+    #[derive(Eq, PartialEq, Ord, PartialOrd, Hash, Copy, Clone)]
+    struct State {
+        y: isize,
+        x: isize,
+        expected: &'static str,
+        is_range: bool,
+    }
+
     // Follow the ASCII edges at the given position.
-    let get_parents = |y: isize, x: isize| -> Vec<String> {
+    // Return a list of (parent, is_range).
+    let get_parents = |y: isize, x: isize| -> Vec<(String, bool)> {
         let mut parents = Vec::new();
         let mut visited = HashSet::new();
-        let mut visit = |y, x, expected: &'static str, to_visit: &mut Vec<(isize, isize, &str)>| {
-            if !visited.contains(&(y, x, expected)) {
-                visited.insert((y, x, expected));
+        let mut visit = |state: State, to_visit: &mut Vec<State>| {
+            if visited.insert(state) {
+                let y = state.y;
+                let x = state.x;
+                let expected = state.expected;
                 let ch = get(y, x);
-                if is_name(ch) && expected.contains('t') {
+                if is_name(ch, direction) && expected.contains('t') {
                     // t: text
-                    parents.push(get_name(y, x));
+                    parents.push((get_name(y, x), state.is_range));
                     return;
                 }
                 if !expected.contains(ch) {
                     return;
                 }
+
+                // Quickly construct a `State`.
+                let is_range = state.is_range || ch == ':' || ch == '.';
+                let s = |y, x, expected| State {
+                    y,
+                    x,
+                    expected,
+                    is_range,
+                };
+
                 match (ch, direction) {
-                    (' ', _) => (),
-                    ('|', BottomTop) => {
-                        to_visit.push((y + 1, x - 1, "/"));
-                        to_visit.push((y + 1, x, "|/\\t"));
-                        to_visit.push((y + 1, x + 1, "\\"));
+                    (' ', _) => {}
+                    ('|', BottomTop) | (':', BottomTop) => {
+                        to_visit.push(s(y + 1, x - 1, "/"));
+                        to_visit.push(s(y + 1, x, ":|/\\t"));
+                        to_visit.push(s(y + 1, x + 1, "\\"));
                     }
                     ('\\', BottomTop) => {
-                        to_visit.push((y + 1, x + 1, "|\\t"));
-                        to_visit.push((y + 1, x, "|t"));
+                        to_visit.push(s(y + 1, x + 1, ":|\\t"));
+                        to_visit.push(s(y + 1, x, ":|t"));
                     }
                     ('/', BottomTop) => {
-                        to_visit.push((y + 1, x - 1, "|/t"));
-                        to_visit.push((y + 1, x, "|t"));
+                        to_visit.push(s(y + 1, x - 1, ":|/t"));
+                        to_visit.push(s(y + 1, x, ":|t"));
                     }
-                    ('-', LeftRight) => {
-                        to_visit.push((y - 1, x - 1, "\\"));
-                        to_visit.push((y, x - 1, "-/\\t"));
-                        to_visit.push((y + 1, x - 1, "/"));
+                    ('-', LeftRight) | ('.', LeftRight) => {
+                        to_visit.push(s(y - 1, x - 1, "\\"));
+                        to_visit.push(s(y, x - 1, ".-/\\t"));
+                        to_visit.push(s(y + 1, x - 1, "/"));
                     }
                     ('\\', LeftRight) => {
-                        to_visit.push((y - 1, x - 1, "-\\t"));
-                        to_visit.push((y, x - 1, "-t"));
+                        to_visit.push(s(y - 1, x - 1, ".-\\t"));
+                        to_visit.push(s(y, x - 1, ".-t"));
                     }
                     ('/', LeftRight) => {
-                        to_visit.push((y + 1, x - 1, "-/t"));
-                        to_visit.push((y, x - 1, "-t"));
+                        to_visit.push(s(y + 1, x - 1, ".-/t"));
+                        to_visit.push(s(y, x - 1, ".-t"));
                     }
                     _ => unreachable!(),
                 }
             }
         };
 
-        let mut to_visit: Vec<(isize, isize, &str)> = match direction {
-            BottomTop => [(y + 1, x - 1, "/"), (y + 1, x, "|"), (y + 1, x + 1, "\\")],
-            LeftRight => [(y - 1, x - 1, "\\"), (y, x - 1, "-"), (y + 1, x - 1, "/")],
+        let s = |y, x, expected| State {
+            y,
+            x,
+            expected,
+            is_range: false,
+        };
+        let mut to_visit: Vec<State> = match direction {
+            BottomTop => [
+                s(y + 1, x - 1, "/"),
+                s(y + 1, x, "|:"),
+                s(y + 1, x + 1, "\\"),
+            ],
+            LeftRight => [
+                s(y - 1, x - 1, "\\"),
+                s(y, x - 1, "-."),
+                s(y + 1, x - 1, "/"),
+            ],
         }
         .iter()
         .cloned()
-        .filter(|(y, x, expected)| expected.contains(get(*y, *x)))
+        .filter(|state| state.expected.contains(get(state.y, state.x)))
         .collect();
-        while let Some((y, x, expected)) = to_visit.pop() {
-            visit(y, x, expected, &mut to_visit);
+        while let Some(state) = to_visit.pop() {
+            visit(state, &mut to_visit);
         }
 
         parents
@@ -163,18 +203,51 @@ pub fn parse(text: impl AsRef<str>) -> BTreeMap<String, BTreeSet<String>> {
     for y in 0..lines.len() as isize {
         for x in 0..lines[y as usize].len() as isize {
             let ch = get(y, x);
-            if is_name(ch) {
+            if is_name(ch, direction) {
                 let name = get_name(y, x);
                 edges.entry(name.clone()).or_default();
-                for parent in get_parents(y, x) {
-                    edges.get_mut(&name).unwrap().insert(parent);
+                for (parent, is_range) in get_parents(y, x) {
+                    if !is_range {
+                        edges.get_mut(&name).unwrap().insert(parent);
+                    } else {
+                        // Insert a chain of name -> parent. For example,
+                        // name="D", parent="A", insert D -> C -> B -> A.
+
+                        assert!(
+                            parent.len() < name.len()
+                                || (parent.len() == name.len() && parent < name),
+                            "empty range: {:?} to {:?}",
+                            parent,
+                            name
+                        );
+
+                        let mut current: String = parent.clone();
+                        loop {
+                            let next = succ::str_succ(&current);
+                            edges.entry(next.clone()).or_default().insert(current);
+
+                            if next == name {
+                                break;
+                            }
+
+                            assert!(
+                                next.len() < name.len()
+                                    || (next.len() == name.len() && next < name),
+                                "mismatched range endpoints: {:?} to {:?}",
+                                parent,
+                                name
+                            );
+
+                            current = next;
+                        }
+                    }
                 }
             }
             // Sanity check
             match (ch, direction) {
                 ('-', BottomTop) => panic!("'-' is incompatible with BottomTop direction"),
                 ('|', LeftRight) => panic!("'|' is incompatible with LeftRight direction"),
-                _ => (),
+                _ => {}
             }
         }
     }
@@ -211,15 +284,15 @@ pub fn commit(
 }
 
 /// Parse the ASCII DAG and commit it. See [`parse`] and [`commit`] for details.
-pub fn drawdag(
-    text: impl AsRef<str>,
-    commit_func: impl FnMut(String, Vec<Box<[u8]>>) -> Box<[u8]>,
-) {
+pub fn drawdag(text: &str, commit_func: impl FnMut(String, Vec<Box<[u8]>>) -> Box<[u8]>) {
     commit(&parse(text), commit_func)
 }
 
-fn is_name(ch: char) -> bool {
-    ch.is_alphanumeric()
+fn is_name(ch: char, direction: Direction) -> bool {
+    match (ch, direction) {
+        ('.', Direction::BottomTop) => true,
+        _ => ch.is_alphanumeric() || ",()_'\"".contains(ch),
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +328,18 @@ mod tests {
         assert_eq!(log.log, expected);
     }
 
+    /// Parse drawdag text, and return a list of strings as the parse result.
+    /// Unlike `assert_drawdag`, `assert_eq!(d(t), e)` works with `cargo-fixeq`.
+    fn p(text: &str) -> Vec<String> {
+        parse(text)
+            .into_iter()
+            .map(|(k, vs)| {
+                let vs = vs.into_iter().collect::<Vec<_>>().join(", ");
+                format!("{} -> [{}]", k, vs)
+            })
+            .collect()
+    }
+
     #[test]
     #[should_panic]
     fn test_drawdag_cycle1() {
@@ -267,6 +352,20 @@ mod tests {
     fn test_drawdag_cycle2() {
         let mut log = CommitLog::new();
         drawdag("A-B-C-A", |n, p| log.commit(n, p));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_drawdag_mismatched_range1() {
+        let mut log = CommitLog::new();
+        drawdag("0..A", |n, p| log.commit(n, p));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_drawdag_mismatched_range2() {
+        let mut log = CommitLog::new();
+        drawdag("(09)..(A0)", |n, p| log.commit(n, p));
     }
 
     #[test]
@@ -340,6 +439,93 @@ I D C F
 7: { parents: ["5"], name: E }
 8: { parents: ["4", "7", "6"], name: A }
 "#,
+        );
+    }
+
+    #[test]
+    fn test_parse_range() {
+        assert_eq!(p("A..D"), ["A -> []", "B -> [A]", "C -> [B]", "D -> [C]"]);
+        assert_eq!(
+            p(r"
+             A1A,B23z,(9z)..A1A,B23z,(10c)
+            "),
+            [
+                "A1A,B23z,(10a) -> [A1A,B23z,(9z)]",
+                "A1A,B23z,(10b) -> [A1A,B23z,(10a)]",
+                "A1A,B23z,(10c) -> [A1A,B23z,(10b)]",
+                "A1A,B23z,(9z) -> []"
+            ]
+        );
+        assert_eq!(
+            p(r"
+            B08
+             :
+            B04"),
+            [
+                "B04 -> []",
+                "B05 -> [B04]",
+                "B06 -> [B05]",
+                "B07 -> [B06]",
+                "B08 -> [B07]"
+            ]
+        );
+        assert_eq!(
+            p(r"
+            B10
+             | \
+             :  C
+             | /
+            B08
+             :
+            B06"),
+            [
+                "B06 -> []",
+                "B07 -> [B06]",
+                "B08 -> [B07]",
+                "B09 -> [B08]",
+                "B10 -> [B09, C]",
+                "C -> [B08]"
+            ]
+        );
+        assert_eq!(
+            p(r"
+             AE
+             | \
+             :  C
+             | /
+             AB
+             :
+             X"),
+            [
+                "AA -> [Z]",
+                "AB -> [AA]",
+                "AC -> [AB]",
+                "AD -> [AC]",
+                "AE -> [AD, C]",
+                "C -> [AB]",
+                "X -> []",
+                "Y -> [X]",
+                "Z -> [Y]"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_special_names() {
+        assert_eq!(
+            p("ancestor(desc(\"D\"),desc('_A'))--B"),
+            [
+                "B -> [ancestor(desc(\"D\"),desc('_A'))]",
+                "ancestor(desc(\"D\"),desc('_A')) -> []"
+            ]
+        );
+        assert_eq!(
+            p(r#"
+                B
+                |
+                .
+              "#),
+            [". -> []", "B -> [.]"]
         );
     }
 }

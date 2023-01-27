@@ -1,10 +1,13 @@
 [package]
 name = "esl01-drawdag"
-version = "0.1.0"
-edition = "2018"
+version = "0.3.0"
+edition = "2021"
 authors = ["Facebook Source Control Team <sourcecontrol-dev@fb.com>"]
-license = "GPL-2.0-only"
+license = "MIT"
 description = "Parse an ASCII DAG into parent relations."
-repository = "https://github.com/facebookexperimental/eden"
+repository = "https://github.com/facebook/sapling"
+
+[lib]
+name = "drawdag"
 
 [dependencies]
