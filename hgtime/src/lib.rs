@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This software may be used and distributed according to the terms of the
  * GNU General Public License version 2.
@@ -9,11 +9,17 @@
 //!
 //! See [`HgTime`] and [`HgTime::parse`] for main features.
 
+use std::ops::Add;
+use std::ops::Range;
+use std::ops::RangeInclusive;
+use std::ops::Sub;
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
 use chrono::prelude::*;
-use chrono::{Duration, LocalResult};
-use std::convert::{TryFrom, TryInto};
-use std::ops::{Add, Range, RangeInclusive, Sub};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use chrono::Duration;
+use chrono::LocalResult;
 
 /// A simple time structure that matches hg's time representation.
 ///
@@ -67,6 +73,29 @@ const INVALID_OFFSET: i32 = i32::max_value();
 static DEFAULT_OFFSET: AtomicI32 = AtomicI32::new(INVALID_OFFSET);
 static FORCED_NOW: AtomicU64 = AtomicU64::new(0); // test only
 
+/// Call `TimeZone` methods on either `Local` (system default) or
+/// TimeZone specified by `set_default_offset`.
+///
+/// This cannot be made as a regular function because:
+/// - TimeZone<Local> and TimeZone<FixedOffset> are different types.
+/// - TimeZone<T> cannot be made into a trait object.
+macro_rules! with_local_timezone {
+    (|$tz:ident| { $($expr: tt)* }) => {
+        {
+            let offset = DEFAULT_OFFSET.load(Ordering::Acquire);
+            match FixedOffset::west_opt(offset) {
+                Some($tz) => {
+                    $($expr)*
+                },
+                None => {
+                    let $tz = Local;
+                    $($expr)*
+                },
+            }
+        }
+    };
+}
+
 impl HgTime {
     /// Supported Range. This is to be compatible with Python stdlib.
     ///
@@ -75,31 +104,33 @@ impl HgTime {
     /// year >= 1900.
     pub const RANGE: RangeInclusive<HgTime> = Self::min_value()..=Self::max_value();
 
-    /// Return the current time, or `None` if the timestamp is outside
-    /// [`HgTime::RANGE`].
+    /// Return the current time with local timezone, or `None` if the timestamp
+    /// is outside [`HgTime::RANGE`].
+    ///
+    /// The local timezone can be affected by `set_default_offset`.
     pub fn now() -> Option<Self> {
-        let forced_now = FORCED_NOW.load(Ordering::SeqCst);
+        let forced_now = FORCED_NOW.load(Ordering::Acquire);
         if forced_now == 0 {
-            Local::now()
-                .try_into()
-                .ok()
-                .map(|t: HgTime| t.use_default_offset())
-                .and_then(|t| t.bounded())
+            Self::try_from(Local::now()).ok().and_then(|mut t: HgTime| {
+                let offset = DEFAULT_OFFSET.load(Ordering::Acquire);
+                if is_valid_offset(offset) {
+                    t.offset = offset;
+                }
+                t.bounded()
+            })
         } else {
             Some(Self::from_compact_u64(forced_now))
         }
     }
 
-    pub fn to_local(self) -> DateTime<Local> {
-        DateTime::from(self.to_utc())
-    }
-
     pub fn to_utc(self) -> DateTime<Utc> {
-        DateTime::from_utc(self.to_naive(), Utc)
+        let naive = NaiveDateTime::from_timestamp(self.unixtime, 0);
+        DateTime::from_utc(naive, Utc)
     }
 
+    /// Converts to `NaiveDateTime` with local timezone specified by `offset`.
     fn to_naive(self) -> NaiveDateTime {
-        NaiveDateTime::from_timestamp(self.unixtime, 0)
+        NaiveDateTime::from_timestamp(self.unixtime - self.offset as i64, 0)
     }
 
     /// Set as the faked "now". Useful for testing.
@@ -118,15 +149,10 @@ impl HgTime {
     pub fn parse(date: &str) -> Option<Self> {
         match date {
             "now" => Self::now(),
-            "today" => Self::now().and_then(|now| {
-                Self::try_from(now.to_local().date().and_hms(0, 0, 0))
-                    .ok()
-                    .map(|t| t.use_default_offset())
-            }),
+            "today" => Self::now()
+                .and_then(|now| Self::try_from(now.to_naive().date().and_hms(0, 0, 0)).ok()),
             "yesterday" => Self::now().and_then(|now| {
-                Self::try_from(now.to_local().date().and_hms(0, 0, 0) - Duration::days(1))
-                    .ok()
-                    .map(|t| t.use_default_offset())
+                Self::try_from((now.to_naive().date() - Duration::days(1)).and_hms(0, 0, 0)).ok()
             }),
             date if date.ends_with(" ago") => {
                 let duration_str = &date[..date.len() - 4];
@@ -135,7 +161,7 @@ impl HgTime {
                     .ok()
                     .and_then(|duration| Self::now().and_then(|n| n - duration.as_secs()))
             }
-            _ => Self::parse_absolute(date, default_date_lower),
+            _ => Self::parse_absolute(date, &default_date_lower),
         }
     }
 
@@ -154,10 +180,9 @@ impl HgTime {
         match date {
             "now" => Self::now().and_then(|n| (n + 1).map(|m| n..m)),
             "today" => Self::now().and_then(|now| {
-                let date = now.to_local().date();
-                let start = Self::try_from(date.and_hms(0, 0, 0)).map(|t| t.use_default_offset());
-                let end =
-                    Self::try_from(date.and_hms(23, 59, 59)).map(|t| t.use_default_offset() + 1);
+                let date = now.to_naive().date();
+                let start = Self::try_from(date.and_hms(0, 0, 0));
+                let end = Self::try_from(date.and_hms(23, 59, 59)).map(|t| t + 1);
                 if let (Ok(start), Ok(Some(end))) = (start, end) {
                     Some(start..end)
                 } else {
@@ -165,10 +190,9 @@ impl HgTime {
                 }
             }),
             "yesterday" => Self::now().and_then(|now| {
-                let date = now.to_local().date() - Duration::days(1);
-                let start = Self::try_from(date.and_hms(0, 0, 0)).map(|t| t.use_default_offset());
-                let end =
-                    Self::try_from(date.and_hms(23, 59, 59)).map(|t| t.use_default_offset() + 1);
+                let date = now.to_naive().date() - Duration::days(1);
+                let start = Self::try_from(date.and_hms(0, 0, 0));
+                let end = Self::try_from(date.and_hms(23, 59, 59)).map(|t| t + 1);
                 if let (Ok(start), Ok(Some(end))) = (start, end) {
                     Some(start..end)
                 } else {
@@ -208,11 +232,11 @@ impl HgTime {
                 }
             }
             _ => {
-                let start = Self::parse_absolute(date, default_date_lower);
-                let end = Self::parse_absolute(date, default_date_upper::<N31>)
-                    .or_else(|| Self::parse_absolute(date, default_date_upper::<N30>))
-                    .or_else(|| Self::parse_absolute(date, default_date_upper::<N29>))
-                    .or_else(|| Self::parse_absolute(date, default_date_upper::<N28>))
+                let start = Self::parse_absolute(date, &default_date_lower);
+                let end = Self::parse_absolute(date, &|c| default_date_upper(c, "31"))
+                    .or_else(|| Self::parse_absolute(date, &|c| default_date_upper(c, "30")))
+                    .or_else(|| Self::parse_absolute(date, &|c| default_date_upper(c, "29")))
+                    .or_else(|| Self::parse_absolute(date, &|c| default_date_upper(c, "28")))
                     .and_then(|end| end + 1);
                 if let (Some(start), Some(end)) = (start, end) {
                     Some(start..end)
@@ -229,7 +253,7 @@ impl HgTime {
     ///
     /// `default_date` takes a format char, for example, `H`, and returns a
     /// default value of it.
-    fn parse_absolute(date: &str, default_date: fn(char) -> &'static str) -> Option<Self> {
+    fn parse_absolute(date: &str, default_date: &dyn Fn(char) -> &'static str) -> Option<Self> {
         let date = date.trim();
 
         // Hg internal format. "unixtime offset"
@@ -261,7 +285,7 @@ impl HgTime {
             let mut default_format = String::new();
             let mut date_with_defaults = date.clone();
             let mut use_now = false;
-            for part in ["S", "M", "HI", "d", "mb", "Yy"].iter() {
+            for part in ["S", "M", "HI", "d", "mb", "Yy"] {
                 if part
                     .chars()
                     .any(|ch| naive_format.contains(&format!("%{}", ch)))
@@ -277,7 +301,7 @@ impl HgTime {
                         // For example, if the user only specified "month/day",
                         // then we should use the current "year", instead of
                         // year 0.
-                        now = now.or_else(|| Self::now().map(|n| n.to_local()));
+                        now = now.or_else(|| Self::now().map(|n| n.to_naive()));
                         match now {
                             Some(now) => {
                                 date_with_defaults +=
@@ -314,16 +338,6 @@ impl HgTime {
         }
 
         None
-    }
-
-    /// Change "offset" to DEFAULT_OFFSET. Useful for tests so they won't be
-    /// affected by local timezone.
-    fn use_default_offset(mut self) -> Self {
-        let offset = DEFAULT_OFFSET.load(Ordering::SeqCst);
-        if is_valid_offset(offset) {
-            self.offset = offset
-        }
-        self
     }
 
     /// See [`HgTime::RANGE`] for details.
@@ -375,12 +389,6 @@ impl From<HgTime> for NaiveDateTime {
 impl From<HgTime> for DateTime<Utc> {
     fn from(time: HgTime) -> Self {
         time.to_utc()
-    }
-}
-
-impl From<HgTime> for DateTime<Local> {
-    fn from(time: HgTime) -> Self {
-        time.to_local()
     }
 }
 
@@ -438,20 +446,20 @@ impl<Tz: TimeZone> TryFrom<DateTime<Tz>> for HgTime {
     }
 }
 
+impl<Tz: TimeZone> TryFrom<LocalResult<DateTime<Tz>>> for HgTime {
+    type Error = ();
+    fn try_from(time: LocalResult<DateTime<Tz>>) -> Result<Self, ()> {
+        match time {
+            LocalResult::Single(datetime) => HgTime::try_from(datetime),
+            _ => Err(()),
+        }
+    }
+}
+
 impl TryFrom<NaiveDateTime> for HgTime {
     type Error = ();
     fn try_from(time: NaiveDateTime) -> Result<Self, ()> {
-        let offset = DEFAULT_OFFSET.load(Ordering::SeqCst);
-        match FixedOffset::west_opt(offset) {
-            Some(offset) => match offset.from_local_datetime(&time) {
-                LocalResult::Single(datetime) => HgTime::try_from(datetime),
-                _ => Err(()),
-            },
-            None => match Local.from_local_datetime(&time) {
-                LocalResult::Single(local) => HgTime::try_from(local),
-                _ => Err(()),
-            },
-        }
+        with_local_timezone!(|tz| { tz.from_local_datetime(&time).try_into() })
     }
 }
 
@@ -474,46 +482,13 @@ fn default_date_lower(format_char: char) -> &'static str {
     }
 }
 
-trait ToStaticStr {
-    fn to_static_str() -> &'static str;
-}
-
-struct N31;
-struct N30;
-struct N29;
-struct N28;
-
-impl ToStaticStr for N31 {
-    fn to_static_str() -> &'static str {
-        "31"
-    }
-}
-
-impl ToStaticStr for N30 {
-    fn to_static_str() -> &'static str {
-        "30"
-    }
-}
-
-impl ToStaticStr for N29 {
-    fn to_static_str() -> &'static str {
-        "29"
-    }
-}
-
-impl ToStaticStr for N28 {
-    fn to_static_str() -> &'static str {
-        "28"
-    }
-}
-
 /// Upper bound. Assume a month has `N::to_static_str()` days.
-fn default_date_upper<N: ToStaticStr>(format_char: char) -> &'static str {
+fn default_date_upper(format_char: char, max_day: &'static str) -> &'static str {
     match format_char {
         'H' => "23",
         'M' | 'S' => "59",
         'm' => "12",
-        'd' => N::to_static_str(),
+        'd' => max_day,
         _ => unreachable!(),
     }
 }
@@ -523,10 +498,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_local_roundtrip() {
-        let now = Local::now().with_nanosecond(0).unwrap();
+    fn test_naive_local_roundtrip() {
+        let now = Local::now().with_nanosecond(0).unwrap().naive_local();
         let hgtime: HgTime = now.try_into().unwrap();
-        let now_again = DateTime::<Local>::from(hgtime);
+        let now_again = hgtime.to_naive();
         assert_eq!(now, now_again);
     }
 
