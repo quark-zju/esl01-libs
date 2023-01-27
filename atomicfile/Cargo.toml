@@ -1,0 +1,15 @@
+[package]
+name = "esl01-atomicfile"
+version = "0.3.0"
+edition = "2021"
+authors = ["Facebook Source Control Team <sourcecontrol-dev@fb.com>"]
+license = "MIT"
+description = "Atomically write a file with retries."
+repository = "https://github.com/facebook/sapling"
+
+[lib]
+name = "atomicfile"
+
+[dependencies]
+tempfile = "3"
+tracing = "0.1"
