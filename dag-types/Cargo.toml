@@ -1,0 +1,25 @@
+[package]
+name = "esl01-dag-types"
+version = "0.3.0"
+edition = "2021"
+authors = ["Facebook Source Control Team <sourcecontrol-dev@fb.com>"]
+license = "MIT"
+description = "A subset of types used by esl01-dag."
+repository = "https://github.com/facebook/sapling"
+
+[lib]
+name = "dag_types"
+
+[dependencies]
+abomonation = { version = "0.7", optional = true }
+abomonation_derive = { version = "0.5", optional = true }
+minibytes = { version = "0.3", default-features = false, package = "esl01-minibytes", path = "../minibytes" }
+quickcheck = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+quickcheck = "1"
+
+[features]
+for-tests = ["quickcheck"]
+serialize-abomonation = ["abomonation", "abomonation_derive"]
