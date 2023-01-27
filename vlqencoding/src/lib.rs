@@ -1,13 +1,15 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 //! VLQ (Variable-length quantity) encoding.
 
-use std::io::{self, Read, Write};
+use std::io;
+use std::io::Read;
+use std::io::Write;
 use std::mem::size_of;
 
 pub trait VLQEncode<T> {
@@ -234,9 +236,14 @@ impl_signed_primitive!(i8, u8);
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::io;
+    use std::io::Cursor;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+
     use quickcheck::quickcheck;
-    use std::io::{self, Cursor, Seek, SeekFrom};
+
+    use super::*;
 
     macro_rules! check_round_trip {
         ($N: expr) => {{
@@ -302,7 +309,7 @@ mod tests {
     #[test]
     fn test_zig_zag() {
         let mut c = Cursor::new(vec![]);
-        for &(i, u) in [
+        for (i, u) in [
             (0, 0),
             (-1, 1),
             (1, 2),
@@ -310,9 +317,7 @@ mod tests {
             (-127, 253),
             (127, 254),
             (-128i8, 255u8),
-        ]
-        .iter()
-        {
+        ] {
             c.seek(SeekFrom::Start(0)).expect("seek");
             c.write_vlq(i).expect("write");
             c.seek(SeekFrom::Start(0)).expect("seek");

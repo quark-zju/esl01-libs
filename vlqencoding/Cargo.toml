@@ -1,11 +1,14 @@
 [package]
 name = "esl01-vlqencoding"
-version = "0.1.0"
-edition = "2018"
+version = "0.3.0"
+edition = "2021"
 authors = ["Facebook Source Control Team <sourcecontrol-dev@fb.com>"]
-license = "GPL-2.0-only"
+license = "MIT"
 description = "VLQ encoding (https://en.wikipedia.org/wiki/Variable-length_quantity)."
-repository = "https://github.com/facebookexperimental/eden"
+repository = "https://github.com/facebook/sapling"
+
+[lib]
+name = "vlqencoding"
 
 [dev-dependencies]
-quickcheck = "0.9"
+quickcheck = "1"
