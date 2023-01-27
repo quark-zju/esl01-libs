@@ -1,54 +1,106 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
-use super::hints::Flags;
-use super::{Hints, NameIter, NameSetQuery};
-use crate::ops::DagAlgorithm;
-use crate::ops::IdConvert;
-use crate::spanset::Span;
-use crate::spanset::{SpanSet, SpanSetIter};
-use crate::Group;
-use crate::Result;
-use crate::VertexName;
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-/// A set backed by [`SpanSet`] + [`IdMap`].
+use nonblocking::non_blocking_result;
+
+use super::hints::Flags;
+use super::AsyncNameSetQuery;
+use super::BoxVertexStream;
+use super::Hints;
+use crate::ops::DagAlgorithm;
+use crate::ops::IdConvert;
+use crate::protocol::disable_remote_protocol;
+use crate::Group;
+use crate::IdSet;
+use crate::IdSetIter;
+use crate::IdSpan;
+use crate::Result;
+use crate::VertexName;
+
+/// A set backed by [`IdSet`] + [`IdMap`].
 /// Efficient for DAG calculation.
 pub struct IdStaticSet {
-    pub(crate) spans: SpanSet,
+    pub(crate) spans: IdSet,
     pub(crate) map: Arc<dyn IdConvert + Send + Sync>,
     pub(crate) dag: Arc<dyn DagAlgorithm + Send + Sync>,
     hints: Hints,
 }
 
 struct Iter {
-    iter: SpanSetIter<SpanSet>,
+    iter: IdSetIter<IdSet>,
     map: Arc<dyn IdConvert + Send + Sync>,
     reversed: bool,
+    buf: Vec<Result<VertexName>>,
 }
 
-impl Iterator for Iter {
-    type Item = Result<VertexName>;
+impl Iter {
+    fn into_box_stream(self) -> BoxVertexStream {
+        Box::pin(futures::stream::unfold(self, |this| this.next()))
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
+    async fn next(mut self) -> Option<(Result<VertexName>, Self)> {
+        if let Some(name) = self.buf.pop() {
+            return Some((name, self));
+        }
         let map = &self.map;
-        if self.reversed {
+        let opt_id = if self.reversed {
             self.iter.next_back()
         } else {
             self.iter.next()
+        };
+        match opt_id {
+            None => None,
+            Some(id) => {
+                let contains = map
+                    .contains_vertex_id_locally(&[id])
+                    .await
+                    .unwrap_or_default();
+                if contains == &[true] {
+                    Some((map.vertex_name(id).await, self))
+                } else {
+                    // On demand prefetch in batch.
+                    let batch_size = 131072;
+                    let mut ids = Vec::with_capacity(batch_size);
+                    ids.push(id);
+                    for _ in ids.len()..batch_size {
+                        if let Some(id) = if self.reversed {
+                            self.iter.next_back()
+                        } else {
+                            self.iter.next()
+                        } {
+                            ids.push(id);
+                        } else {
+                            break;
+                        }
+                    }
+                    ids.reverse();
+                    self.buf = match self.map.vertex_name_batch(&ids).await {
+                        Err(e) => return Some((Err(e), self)),
+                        Ok(names) => names,
+                    };
+                    if self.buf.len() != ids.len() {
+                        let result =
+                            crate::errors::bug("vertex_name_batch does not return enough items");
+                        return Some((result, self));
+                    }
+                    let name = self.buf.pop().expect("buf is not empty");
+                    Some((name, self))
+                }
+            }
         }
-        .map(|id| map.vertex_name(id))
     }
 }
 
 struct DebugSpan {
-    span: Span,
+    span: IdSpan,
     low_name: Option<VertexName>,
     high_name: Option<VertexName>,
 }
@@ -89,12 +141,16 @@ impl fmt::Debug for IdStaticSet {
         f.debug_list()
             .entries(spans.iter().take(limit).map(|span| DebugSpan {
                 span: *span,
-                low_name: self.map.vertex_name(span.low).ok(),
-                high_name: self.map.vertex_name(span.high).ok(),
+                low_name: disable_remote_protocol(|| {
+                    non_blocking_result(self.map.vertex_name(span.low)).ok()
+                }),
+                high_name: disable_remote_protocol(|| {
+                    non_blocking_result(self.map.vertex_name(span.high)).ok()
+                }),
             }))
             .finish()?;
         match spans.len().max(limit) - limit {
-            0 => (),
+            0 => {}
             1 => write!(f, " + 1 span")?,
             n => write!(f, " + {} spans", n)?,
         }
@@ -105,7 +161,7 @@ impl fmt::Debug for IdStaticSet {
 
 impl IdStaticSet {
     pub(crate) fn from_spans_idmap_dag(
-        spans: SpanSet,
+        spans: IdSet,
         map: Arc<dyn IdConvert + Send + Sync>,
         dag: Arc<dyn DagAlgorithm + Send + Sync>,
     ) -> Self {
@@ -126,63 +182,74 @@ impl IdStaticSet {
     }
 }
 
-impl NameSetQuery for IdStaticSet {
-    fn iter(&self) -> Result<Box<dyn NameIter>> {
+#[async_trait::async_trait]
+impl AsyncNameSetQuery for IdStaticSet {
+    async fn iter(&self) -> Result<BoxVertexStream> {
         let iter = Iter {
             iter: self.spans.clone().into_iter(),
             map: self.map.clone(),
             reversed: false,
+            buf: Default::default(),
         };
-        Ok(Box::new(iter))
+        Ok(iter.into_box_stream())
     }
 
-    fn iter_rev(&self) -> Result<Box<dyn NameIter>> {
+    async fn iter_rev(&self) -> Result<BoxVertexStream> {
         let iter = Iter {
             iter: self.spans.clone().into_iter(),
             map: self.map.clone(),
             reversed: true,
+            buf: Default::default(),
         };
-        Ok(Box::new(iter))
+        Ok(iter.into_box_stream())
     }
 
-    fn count(&self) -> Result<usize> {
+    async fn count(&self) -> Result<usize> {
         Ok(self.spans.count() as usize)
     }
 
-    fn first(&self) -> Result<Option<VertexName>> {
-        debug_assert_eq!(self.spans.max(), self.spans.iter().nth(0));
+    async fn first(&self) -> Result<Option<VertexName>> {
+        debug_assert_eq!(self.spans.max(), self.spans.iter_desc().nth(0));
         match self.spans.max() {
             Some(id) => {
                 let map = &self.map;
-                let name = map.vertex_name(id)?;
+                let name = map.vertex_name(id).await?;
                 Ok(Some(name))
             }
             None => Ok(None),
         }
     }
 
-    fn last(&self) -> Result<Option<VertexName>> {
-        debug_assert_eq!(self.spans.min(), self.spans.iter().rev().nth(0));
+    async fn last(&self) -> Result<Option<VertexName>> {
+        debug_assert_eq!(self.spans.min(), self.spans.iter_desc().rev().nth(0));
         match self.spans.min() {
             Some(id) => {
                 let map = &self.map;
-                let name = map.vertex_name(id)?;
+                let name = map.vertex_name(id).await?;
                 Ok(Some(name))
             }
             None => Ok(None),
         }
     }
 
-    fn is_empty(&self) -> Result<bool> {
+    async fn is_empty(&self) -> Result<bool> {
         Ok(self.spans.is_empty())
     }
 
-    fn contains(&self, name: &VertexName) -> Result<bool> {
-        let result = match self.map.vertex_id_with_max_group(name, Group::NON_MASTER)? {
+    async fn contains(&self, name: &VertexName) -> Result<bool> {
+        let result = match self
+            .map
+            .vertex_id_with_max_group(name, Group::NON_MASTER)
+            .await?
+        {
             Some(id) => self.spans.contains(id),
             None => false,
         };
         Ok(result)
+    }
+
+    async fn contains_fast(&self, name: &VertexName) -> Result<Option<bool>> {
+        self.contains(name).await.map(Some)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -199,14 +266,18 @@ impl NameSetQuery for IdStaticSet {
 }
 
 #[cfg(test)]
+#[allow(clippy::redundant_clone)]
 pub(crate) mod tests {
+    use std::ops::Deref;
+
+    use nonblocking::non_blocking_result as r;
+
     use super::super::tests::*;
     use super::super::NameSet;
     use super::*;
     use crate::tests::build_segments;
     use crate::DagAlgorithm;
     use crate::NameDag;
-    use std::ops::Deref;
 
     /// Test with a predefined DAG.
     pub(crate) fn with_dag<R, F: Fn(&NameDag) -> R>(func: F) -> R {
@@ -225,7 +296,7 @@ pub(crate) mod tests {
     #[test]
     fn test_dag_invariants() -> Result<()> {
         with_dag(|dag| {
-            let bef = dag.range("B".into(), "F".into())?;
+            let bef = r(dag.range("B".into(), "F".into()))?;
             check_invariants(bef.deref())?;
 
             Ok(())
@@ -235,14 +306,14 @@ pub(crate) mod tests {
     #[test]
     fn test_dag_fast_paths() -> Result<()> {
         with_dag(|dag| {
-            let abcd = dag.ancestors("D".into())?;
-            let abefg = dag.ancestors("G".into())?;
+            let abcd = r(dag.ancestors("D".into()))?;
+            let abefg = r(dag.ancestors("G".into()))?;
 
             let ab = abcd.intersection(&abefg);
             check_invariants(ab.deref())?;
 
-            assert!(abcd.contains(&vec![b'A'].into())?);
-            assert!(!abcd.contains(&vec![b'E'].into())?);
+            assert!(nb(abcd.contains(&vec![b'A'].into()))?);
+            assert!(!nb(abcd.contains(&vec![b'E'].into()))?);
 
             // should not be "<and <...> <...>>"
             assert_eq!(format!("{:?}", &ab), "<spans [A:B+0:1]>");
@@ -266,8 +337,8 @@ pub(crate) mod tests {
         let f = |s: NameSet| -> String { format!("{:?}", s) };
         with_dag(|dag1| -> Result<()> {
             with_dag(|dag2| -> Result<()> {
-                let abcd = dag1.ancestors("D".into())?;
-                let abefg = dag2.ancestors("G".into())?;
+                let abcd = r(dag1.ancestors("D".into()))?;
+                let abefg = r(dag2.ancestors("G".into()))?;
 
                 // Since abcd and abefg are from 2 "separate" Dags, fast paths should not
                 // be used for intersection, union, and difference.
@@ -298,8 +369,8 @@ pub(crate) mod tests {
 
                 // Should not use FULL hint fast paths for "&, |, -" operations, because
                 // dag1 and dag2 are not considered compatible.
-                let a1 = || dag1.all().unwrap();
-                let a2 = || dag2.all().unwrap();
+                let a1 = || r(dag1.all()).unwrap();
+                let a2 = || r(dag2.all()).unwrap();
                 assert_eq!(f(a1() & a2()), "<and <spans [A:G+0:6]> <spans [A:G+0:6]>>");
                 assert_eq!(f(a1() | a2()), "<or <spans [A:G+0:6]> <spans [A:G+0:6]>>");
                 assert_eq!(f(a1() - a2()), "<diff <spans [A:G+0:6]> <spans [A:G+0:6]>>");
@@ -311,7 +382,7 @@ pub(crate) mod tests {
                 assert_eq!(f(z() & a2()), "<and <static [Z]> <spans [A:G+0:6]>>");
                 assert_eq!(f(z() | a2()), "<or <static [Z]> <spans [A:G+0:6]>>");
                 assert_eq!(f(z() - a2()), "<diff <static [Z]> <spans [A:G+0:6]>>");
-                assert_eq!(f(a1() & z()), "<and <spans [A:G+0:6]> <static [Z]>>");
+                assert_eq!(f(a1() & z()), "<and <static [Z]> <spans [A:G+0:6]>>");
                 assert_eq!(f(a1() | z()), "<or <spans [A:G+0:6]> <static [Z]>>");
                 assert_eq!(f(a1() - z()), "<diff <spans [A:G+0:6]> <static [Z]>>");
 
@@ -332,11 +403,11 @@ pub(crate) mod tests {
     #[test]
     fn test_dag_all() -> Result<()> {
         with_dag(|dag| {
-            let all = dag.all()?;
+            let all = r(dag.all())?;
             assert_eq!(format!("{:?}", &all), "<spans [A:G+0:6]>");
 
             let ac: NameSet = "A C".into();
-            let ac = dag.sort(&ac)?;
+            let ac = r(dag.sort(&ac))?;
 
             let intersection = all.intersection(&ac);
             // should not be "<and ...>"
@@ -349,7 +420,7 @@ pub(crate) mod tests {
     fn test_sort() -> Result<()> {
         with_dag(|dag| -> Result<()> {
             let set = "G C A E".into();
-            let sorted = dag.sort(&set)?;
+            let sorted = r(dag.sort(&set))?;
             assert_eq!(format!("{:?}", &sorted), "<spans [G+6, E+4, C+2] + 1 span>");
             Ok(())
         })
@@ -358,20 +429,20 @@ pub(crate) mod tests {
     #[test]
     fn test_dag_hints_ancestors() -> Result<()> {
         with_dag(|dag| -> Result<()> {
-            let abc = dag.ancestors("B C".into())?;
-            let abe = dag.common_ancestors("E".into())?;
+            let abc = r(dag.ancestors("B C".into()))?;
+            let abe = r(dag.common_ancestors("E".into()))?;
             let f: NameSet = "F".into();
-            let all = dag.all()?;
+            let all = r(dag.all())?;
 
             assert!(has_ancestors_flag(abc.clone()));
             assert!(has_ancestors_flag(abe.clone()));
             assert!(has_ancestors_flag(all.clone()));
-            assert!(has_ancestors_flag(dag.roots(abc.clone())?));
-            assert!(has_ancestors_flag(dag.parents(all.clone())?));
+            assert!(has_ancestors_flag(r(dag.roots(abc.clone()))?));
+            assert!(has_ancestors_flag(r(dag.parents(all.clone()))?));
 
             assert!(!has_ancestors_flag(f.clone()));
-            assert!(!has_ancestors_flag(dag.roots(f.clone())?));
-            assert!(!has_ancestors_flag(dag.parents(f.clone())?));
+            assert!(!has_ancestors_flag(r(dag.roots(f.clone()))?));
+            assert!(!has_ancestors_flag(r(dag.parents(f.clone()))?));
 
             Ok(())
         })
@@ -381,20 +452,20 @@ pub(crate) mod tests {
     fn test_dag_hints_ancestors_inheritance() -> Result<()> {
         with_dag(|dag1| -> Result<()> {
             with_dag(|dag2| -> Result<()> {
-                let abc = dag1.ancestors("B C".into())?;
+                let abc = r(dag1.ancestors("B C".into()))?;
 
                 // The ANCESTORS flag is kept by 'sort', 'parents', 'roots' on
                 // the same dag.
-                assert!(has_ancestors_flag(dag1.sort(&abc)?));
-                assert!(has_ancestors_flag(dag1.parents(abc.clone())?));
-                assert!(has_ancestors_flag(dag1.roots(abc.clone())?));
+                assert!(has_ancestors_flag(r(dag1.sort(&abc))?));
+                assert!(has_ancestors_flag(r(dag1.parents(abc.clone()))?));
+                assert!(has_ancestors_flag(r(dag1.roots(abc.clone()))?));
 
                 // The ANCESTORS flag is removed on a different dag, since the
                 // different dag does not assume same graph / ancestry
                 // relationship.
-                assert!(!has_ancestors_flag(dag2.sort(&abc)?));
-                assert!(!has_ancestors_flag(dag2.parents(abc.clone())?));
-                assert!(!has_ancestors_flag(dag2.roots(abc.clone())?));
+                assert!(!has_ancestors_flag(r(dag2.sort(&abc))?));
+                assert!(!has_ancestors_flag(r(dag2.parents(abc.clone()))?));
+                assert!(!has_ancestors_flag(r(dag2.roots(abc.clone()))?));
 
                 Ok(())
             })
@@ -411,30 +482,27 @@ pub(crate) mod tests {
 
             // Fast paths are not used if the set is not "bound" to the dag.
             assert_eq!(
-                format!("{:?}", dag.ancestors(bfg.clone())?),
-                "<spans [E:G+4:6, A:B+0:1]>"
+                format!("{:?}", r(dag.ancestors(bfg.clone()))?),
+                "<static [B, F, G]>"
             );
-            assert_eq!(
-                format!("{:?}", dag.heads(bfg.clone())?),
-                "<spans [G+6, B+1]>"
-            );
+            assert_eq!(format!("{:?}", r(dag.heads(bfg.clone()))?), "<spans [G+6]>");
 
             // Binding to the Dag enables fast paths.
-            let bfg = dag.sort(&bfg)?;
+            let bfg = r(dag.sort(&bfg))?;
             bfg.hints().add_flags(Flags::ANCESTORS);
             assert_eq!(
-                format!("{:?}", dag.ancestors(bfg.clone())?),
+                format!("{:?}", r(dag.ancestors(bfg.clone()))?),
                 "<spans [F:G+5:6, B+1]>"
             );
 
             // 'heads' has a fast path that uses 'heads_ancestors' to do the calculation.
             // (in this case the result is incorrect because the hints are wrong).
-            assert_eq!(format!("{:?}", dag.heads(bfg.clone())?), "<spans [G+6]>");
+            assert_eq!(format!("{:?}", r(dag.heads(bfg.clone()))?), "<spans [G+6]>");
 
             // 'ancestors' has a fast path that returns set as-is.
             // (in this case the result is incorrect because the hints are wrong).
             assert_eq!(
-                format!("{:?}", dag.ancestors(bfg.clone())?),
+                format!("{:?}", r(dag.ancestors(bfg.clone()))?),
                 "<spans [F:G+5:6, B+1]>"
             );
 

@@ -1,24 +1,29 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
+
+use std::cmp;
+use std::fmt;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::Acquire;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::Ordering::Release;
+use std::sync::Arc;
+
+use bitflags::bitflags;
 
 use crate::ops::DagAlgorithm;
 use crate::ops::IdConvert;
 use crate::Id;
-use bitflags::bitflags;
-use std::fmt;
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicU32, AtomicU64};
-use std::sync::Arc;
+use crate::VerLink;
 
 bitflags! {
     pub struct Flags: u32 {
         /// Full. A full Set & other set X with compatible Dag results in X.
-        /// Use `set_dag` to set the Dag pointer to avoid fast paths
-        /// intersecting incompatible Dags.
         const FULL = 0x1;
 
         /// Empty (also implies ID_DESC | ID_ASC | TOPO_DESC).
@@ -72,6 +77,44 @@ impl Hints {
 
     pub fn new_inherit_idmap_dag(hints: &Self) -> Self {
         Self::new_with_idmap_dag(hints, hints)
+    }
+
+    /// Attempt to inherit properties (IdMap and Dag snapshots) from a list of
+    /// hints. The returned hints have IdMap and Dag set to be compatible with
+    /// all other hints in the list (or set to be None if that's not possible).
+    pub fn union(hints_list: &[&Self]) -> Self {
+        let default = Self::default();
+        // Find the id_map that is compatible with all other id_maps.
+        debug_assert!(default.id_map().is_none());
+        let id_map = hints_list
+            .iter()
+            .fold(Some(&default), |opt_a, b| {
+                opt_a.and_then(
+                    |a| match a.id_map_version().partial_cmp(&b.id_map_version()) {
+                        None => None, // Incompatible sets
+                        Some(cmp::Ordering::Equal) | Some(cmp::Ordering::Greater) => Some(a),
+                        Some(cmp::Ordering::Less) => Some(b),
+                    },
+                )
+            })
+            .and_then(|a| a.id_map());
+        // Find the dag that is compatible with all other dags.
+        debug_assert!(default.dag().is_none());
+        let dag = hints_list
+            .iter()
+            .fold(Some(&default), |opt_a, b| {
+                opt_a.and_then(|a| match a.dag_version().partial_cmp(&b.dag_version()) {
+                    None => None,
+                    Some(cmp::Ordering::Equal) | Some(cmp::Ordering::Greater) => Some(a),
+                    Some(cmp::Ordering::Less) => Some(b),
+                })
+            })
+            .and_then(|a| a.dag());
+        Self {
+            id_map: IdMapSnapshot(id_map),
+            dag: DagSnapshot(dag),
+            ..Self::default()
+        }
     }
 
     pub fn flags(&self) -> Flags {
@@ -145,34 +188,22 @@ impl Hints {
         self
     }
 
-    #[allow(clippy::vtable_address_comparisons)]
-    pub fn is_id_map_compatible(&self, other: impl Into<IdMapSnapshot>) -> bool {
-        let lhs = self.id_map.0.clone();
-        let rhs = other.into().0;
-        match (lhs, rhs) {
-            (None, None) => true,
-            (Some(l), Some(r)) => Arc::ptr_eq(&l, &r),
-            (None, Some(_)) | (Some(_), None) => false,
-        }
-    }
-
-    #[allow(clippy::vtable_address_comparisons)]
-    pub fn is_dag_compatible(&self, other: impl Into<DagSnapshot>) -> bool {
-        let lhs = self.dag.0.clone();
-        let rhs = other.into().0;
-        match (lhs, rhs) {
-            (None, None) => true,
-            (Some(l), Some(r)) => Arc::ptr_eq(&l, &r),
-            (None, Some(_)) | (Some(_), None) => false,
-        }
-    }
-
     pub fn dag(&self) -> Option<Arc<dyn DagAlgorithm + Send + Sync>> {
         self.dag.0.clone()
     }
 
     pub fn id_map(&self) -> Option<Arc<dyn IdConvert + Send + Sync>> {
         self.id_map.0.clone()
+    }
+
+    /// The `VerLink` of the Dag. `None` if there is no Dag associated.
+    pub fn dag_version(&self) -> Option<&VerLink> {
+        self.dag.0.as_ref().map(|d| d.dag_version())
+    }
+
+    /// The `VerLink` of the IdMap. `None` if there is no IdMap associated.
+    pub fn id_map_version(&self) -> Option<&VerLink> {
+        self.id_map.0.as_ref().map(|d| d.map_version())
     }
 }
 
@@ -206,6 +237,42 @@ impl From<Arc<dyn IdConvert + Send + Sync>> for IdMapSnapshot {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct DagVersion<'a>(Option<&'a VerLink>);
+
+impl<'a> From<&'a Hints> for DagVersion<'a> {
+    fn from(hints: &'a Hints) -> Self {
+        Self(match &hints.dag.0 {
+            Some(d) => Some(d.dag_version()),
+            None => None,
+        })
+    }
+}
+
+impl<'a> From<&'a VerLink> for DagVersion<'a> {
+    fn from(version: &'a VerLink) -> Self {
+        Self(Some(version))
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct IdMapVersion<'a>(Option<&'a VerLink>);
+
+impl<'a> From<&'a Hints> for IdMapVersion<'a> {
+    fn from(hints: &'a Hints) -> Self {
+        Self(match &hints.id_map.0 {
+            Some(m) => Some(m.map_version()),
+            None => None,
+        })
+    }
+}
+
+impl<'a> From<&'a VerLink> for IdMapVersion<'a> {
+    fn from(version: &'a VerLink) -> Self {
+        Self(Some(version))
+    }
+}
+
 impl Clone for Hints {
     fn clone(&self) -> Self {
         Self {
@@ -229,9 +296,35 @@ impl fmt::Debug for Hints {
             (Some(min), Some(max)) => write!(f, ", {}..={}", min.0, max.0)?,
             (Some(min), None) => write!(f, ", {}..", min.0)?,
             (None, Some(max)) => write!(f, ", ..={}", max.0)?,
-            (None, None) => (),
+            (None, None) => {}
         }
         write!(f, ")")?;
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn test_incompatilbe_union() {
+    use crate::tests::dummy_dag::DummyDag;
+    let dag1 = DummyDag::new();
+    let dag2 = DummyDag::new();
+
+    let mut hints1 = Hints::default();
+    hints1.dag = DagSnapshot(Some(dag1.dag_snapshot().unwrap()));
+
+    let mut hints2 = Hints::default();
+    hints2.dag = DagSnapshot(Some(dag2.dag_snapshot().unwrap()));
+
+    assert_eq!(
+        Hints::union(&[&hints1, &hints1]).dag_version(),
+        hints1.dag_version()
+    );
+
+    assert_eq!(Hints::union(&[&hints1, &hints2]).dag_version(), None);
+    assert_eq!(Hints::union(&[&hints2, &hints1]).dag_version(), None);
+    assert_eq!(
+        Hints::union(&[&hints2, &hints1, &hints2]).dag_version(),
+        None
+    );
 }

@@ -1,476 +1,39 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 //! # idmap
 //!
 //! See [`IdMap`] for the main structure.
 
+use std::borrow::Cow;
+
 use crate::errors::bug;
-use crate::errors::programming;
-use crate::id::{Group, Id, VertexName};
+use crate::id::Group;
+use crate::id::Id;
+use crate::id::VertexName;
 use crate::ops::IdConvert;
-use crate::ops::PrefixLookup;
+use crate::ops::Parents;
+use crate::segment::PreparedFlatSegments;
+use crate::types_ext::PreparedFlatSegmentsExt;
+use crate::Error;
+use crate::IdSet;
 use crate::Result;
-use byteorder::{BigEndian, ReadBytesExt};
-use fs2::FileExt;
-use indexedlog::log;
-use std::collections::{BTreeMap, HashMap};
-use std::fmt;
-use std::fs::{self, File};
-use std::io::{Cursor, Read};
-use std::ops::{Deref, DerefMut};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{self, AtomicU64};
 
-/// Bi-directional mapping between an integer id and a name (`[u8]`).
-///
-/// Backed by the filesystem.
-pub struct IdMap {
-    log: log::Log,
-    path: PathBuf,
-    cached_next_free_ids: [AtomicU64; Group::COUNT],
-    pub(crate) need_rebuild_non_master: bool,
-}
+#[cfg(any(test, feature = "indexedlog-backend"))]
+mod indexedlog_idmap;
+mod mem_idmap;
 
-/// Bi-directional mapping between an integer id and a name (`[u8]`).
-///
-/// Private. Stored in memory.
-#[derive(Default)]
-pub struct MemIdMap {
-    id2name: HashMap<Id, VertexName>,
-    name2id: BTreeMap<VertexName, Id>,
-    cached_next_free_ids: [AtomicU64; Group::COUNT],
-}
-
-/// Guard to make sure [`IdMap`] on-disk writes are race-free.
-///
-/// Constructing this struct will take a filesystem lock and reload
-/// the content from the filesystem. Dropping this struct will write
-/// down changes to the filesystem and release the lock.
-pub struct SyncableIdMap<'a> {
-    map: &'a mut IdMap,
-    lock_file: File,
-}
-
-impl IdMap {
-    const INDEX_ID_TO_NAME: usize = 0;
-    const INDEX_GROUP_NAME_TO_ID: usize = 1;
-
-    /// Magic bytes in `Log` that indicates "remove all non-master id->name
-    /// mappings". A valid entry has at least 8 bytes so does not conflict
-    /// with this.
-    const MAGIC_CLEAR_NON_MASTER: &'static [u8] = b"CLRNM";
-
-    /// Start offset in an entry for "name".
-    const NAME_OFFSET: usize = 8 + Group::BYTES;
-
-    /// Create an [`IdMap`] backed by the given directory.
-    ///
-    /// By default, only read-only operations are allowed. For writing
-    /// access, call [`IdMap::make_writable`] to get a writable instance.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let log = Self::log_open_options().open(path)?;
-        Self::open_from_log(log)
-    }
-
-    pub(crate) fn try_clone(&self) -> Result<Self> {
-        let result = Self {
-            log: self.log.try_clone()?,
-            path: self.path.clone(),
-            cached_next_free_ids: Default::default(),
-            need_rebuild_non_master: self.need_rebuild_non_master,
-        };
-        Ok(result)
-    }
-
-    pub(crate) fn open_from_log(log: log::Log) -> Result<Self> {
-        let path = log.path().as_opt_path().unwrap().to_path_buf();
-        Ok(Self {
-            log,
-            path,
-            cached_next_free_ids: Default::default(),
-            need_rebuild_non_master: false,
-        })
-    }
-
-    pub(crate) fn log_open_options() -> log::OpenOptions {
-        log::OpenOptions::new()
-            .create(true)
-            .index("id", |data| {
-                assert!(Self::MAGIC_CLEAR_NON_MASTER.len() < 8);
-                assert!(Group::BITS == 8);
-                if data.len() < 8 {
-                    if data == Self::MAGIC_CLEAR_NON_MASTER {
-                        vec![log::IndexOutput::RemovePrefix(Box::new([
-                            Group::NON_MASTER.0 as u8,
-                        ]))]
-                    } else {
-                        panic!("bug: invalid segment {:?}", &data);
-                    }
-                } else {
-                    vec![log::IndexOutput::Reference(0..8)]
-                }
-            })
-            .index("group-name", |data| {
-                if data.len() >= 8 {
-                    vec![log::IndexOutput::Reference(8..(data.len() as u64))]
-                } else {
-                    if data == Self::MAGIC_CLEAR_NON_MASTER {
-                        vec![log::IndexOutput::RemovePrefix(Box::new([
-                            Group::NON_MASTER.0 as u8,
-                        ]))]
-                    } else {
-                        panic!("bug: invalid segment {:?}", &data);
-                    }
-                }
-            })
-            .flush_filter(Some(|_, _| {
-                panic!("programming error: idmap changed by other process")
-            }))
-    }
-
-    /// Return a [`SyncableIdMap`] instance that provides race-free
-    /// filesytem read and write access by taking an exclusive lock.
-    ///
-    /// The [`SyncableIdMap`] instance provides a `sync` method that
-    /// actually writes changes to disk.
-    ///
-    /// Block if another instance is taking the lock.
-    pub fn prepare_filesystem_sync(&mut self) -> Result<SyncableIdMap> {
-        if self.log.iter_dirty().next().is_some() {
-            return programming(
-                "prepare_filesystem_sync must be called without dirty in-memory entries",
-            );
-        }
-
-        // Take a filesystem lock. The file name 'lock' is taken by indexedlog
-        // running on Windows, so we choose another file name here.
-        let lock_file = {
-            let mut path = self.path.clone();
-            path.push("wlock");
-            File::open(&path).or_else(|_| {
-                fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-            })?
-        };
-        lock_file.lock_exclusive()?;
-
-        // Reload. So we get latest data.
-        self.reload()?;
-
-        Ok(SyncableIdMap {
-            map: self,
-            lock_file,
-        })
-    }
-
-    /// Reload from the filesystem. Discard pending changes.
-    fn reload(&mut self) -> Result<()> {
-        self.log.clear_dirty()?;
-        self.log.sync()?;
-        // Invalidate the next free id cache.
-        self.cached_next_free_ids = Default::default();
-        Ok(())
-    }
-
-    /// Find name by a specified integer id.
-    pub fn find_name_by_id(&self, id: Id) -> Result<Option<&[u8]>> {
-        let key = id.0.to_be_bytes();
-        let key = self.log.lookup(Self::INDEX_ID_TO_NAME, &key)?.nth(0);
-        match key {
-            Some(Ok(entry)) => {
-                if entry.len() < 8 {
-                    return bug("index key should have 8 bytes at least");
-                }
-                Ok(Some(&entry[Self::NAME_OFFSET..]))
-            }
-            None => Ok(None),
-            Some(Err(err)) => Err(err.into()),
-        }
-    }
-
-    /// Find VertexName by a specified integer id.
-    pub fn find_vertex_name_by_id(&self, id: Id) -> Result<Option<VertexName>> {
-        self.find_name_by_id(id)
-            .map(|v| v.map(|n| VertexName(self.log.slice_to_bytes(n))))
-    }
-
-    /// Find the integer id matching the given name.
-    pub fn find_id_by_name(&self, name: &[u8]) -> Result<Option<Id>> {
-        for group in Group::ALL.iter() {
-            let mut group_name = Vec::with_capacity(Group::BYTES + name.len());
-            group_name.extend_from_slice(&group.bytes());
-            group_name.extend_from_slice(name);
-            let key = self
-                .log
-                .lookup(Self::INDEX_GROUP_NAME_TO_ID, group_name)?
-                .nth(0);
-            match key {
-                Some(Ok(mut entry)) => {
-                    if entry.len() < 8 {
-                        return bug("index key should have 8 bytes at least");
-                    }
-                    let id = Id(entry.read_u64::<BigEndian>().unwrap());
-                    return Ok(Some(id));
-                }
-                None => (),
-                Some(Err(err)) => return Err(err.into()),
-            }
-        }
-        Ok(None)
-    }
-
-    /// Similar to `find_name_by_id`, but returns None if group > `max_group`.
-    pub fn find_id_by_name_with_max_group(
-        &self,
-        name: &[u8],
-        max_group: Group,
-    ) -> Result<Option<Id>> {
-        Ok(self.find_id_by_name(name)?.and_then(|id| {
-            if id.group() <= max_group {
-                Some(id)
-            } else {
-                None
-            }
-        }))
-    }
-
-    /// Insert a new entry mapping from a name to an id.
-    ///
-    /// Errors if the new entry conflicts with existing entries.
-    pub fn insert(&mut self, id: Id, name: &[u8]) -> Result<()> {
-        let group = id.group();
-        if id < self.next_free_id(group)? {
-            let existing_name = self.find_name_by_id(id)?;
-            if let Some(existing_name) = existing_name {
-                if existing_name == name {
-                    return Ok(());
-                } else {
-                    return bug(format!(
-                        "new entry {} = {:?} conflicts with an existing entry {} = {:?}",
-                        id, name, id, existing_name
-                    ));
-                }
-            }
-        }
-        let existing_id = self.find_id_by_name(name)?;
-        if let Some(existing_id) = existing_id {
-            // Allow re-assigning Ids from a higher group to a lower group.
-            // For example, when a non-master commit gets merged into the
-            // master branch, the id is re-assigned to master. But, the
-            // ids in the master group will never be re-assigned to
-            // non-master groups.
-            if existing_id == id {
-                return Ok(());
-            } else if existing_id.group() <= group {
-                return bug(format!(
-                    "new entry {} = {:?} conflicts with an existing entry {} = {:?}",
-                    id, name, existing_id, name
-                ));
-            }
-            // Mark "need_rebuild_non_master". This prevents "sync" until
-            // the callsite uses "remove_non_master" to remove and re-insert
-            // non-master ids.
-            self.need_rebuild_non_master = true;
-        }
-
-        let mut data = Vec::with_capacity(8 + Group::BYTES + name.len());
-        data.extend_from_slice(&id.0.to_be_bytes());
-        data.extend_from_slice(&id.group().bytes());
-        data.extend_from_slice(&name);
-        self.log.append(data)?;
-        let next_free_id = self.cached_next_free_ids[group.0].get_mut();
-        if id.0 >= *next_free_id {
-            *next_free_id = id.0 + 1;
-        }
-        Ok(())
-    }
-
-    /// Return the next unused id in the given group.
-    pub fn next_free_id(&self, group: Group) -> Result<Id> {
-        let cached = self.cached_next_free_ids[group.0].load(atomic::Ordering::SeqCst);
-        let id = if cached == 0 {
-            let id = Self::get_next_free_id(&self.log, group)?;
-            self.cached_next_free_ids[group.0].store(id.0, atomic::Ordering::SeqCst);
-            id
-        } else {
-            Id(cached)
-        };
-        Ok(id)
-    }
-
-    /// Lookup names by hex prefix.
-    fn find_names_by_hex_prefix(&self, hex_prefix: &[u8], limit: usize) -> Result<Vec<VertexName>> {
-        let mut result = Vec::with_capacity(limit);
-        for group in Group::ALL.iter().rev() {
-            let mut prefix = Vec::with_capacity(Group::BYTES * 2 + hex_prefix.len());
-            prefix.extend_from_slice(&group.hex_bytes());
-            prefix.extend_from_slice(hex_prefix);
-            for entry in self
-                .log
-                .lookup_prefix_hex(Self::INDEX_GROUP_NAME_TO_ID, prefix)?
-            {
-                let (k, _v) = entry?;
-                let vertex = VertexName(self.log.slice_to_bytes(&k[Group::BYTES..]));
-                if !result.contains(&vertex) {
-                    result.push(vertex);
-                }
-                if result.len() >= limit {
-                    return Ok(result);
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    // Find an unused id that is bigger than existing ids.
-    // Used internally. It should match `next_free_id`.
-    fn get_next_free_id(log: &log::Log, group: Group) -> Result<Id> {
-        // Checks should have been done at callsite.
-        let lower_bound_id = group.min_id();
-        let upper_bound_id = group.max_id();
-        let lower_bound = lower_bound_id.to_bytearray();
-        let upper_bound = upper_bound_id.to_bytearray();
-        let range = &lower_bound[..]..=&upper_bound[..];
-        let mut iter = log.lookup_range(Self::INDEX_ID_TO_NAME, range)?.rev();
-        let id = match iter.nth(0) {
-            None => lower_bound_id,
-            Some(Ok((key, _))) => Id(Cursor::new(key).read_u64::<BigEndian>()? + 1),
-            _ => return bug(format!("cannot read next_free_id for group {}", group)),
-        };
-        debug_assert!(id >= lower_bound_id);
-        debug_assert!(id <= upper_bound_id);
-        Ok(id)
-    }
-}
-
-impl MemIdMap {
-    /// Create an empty [`MemIdMap`].
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl Clone for MemIdMap {
-    fn clone(&self) -> Self {
-        Self {
-            id2name: self.id2name.clone(),
-            name2id: self.name2id.clone(),
-            cached_next_free_ids: [
-                AtomicU64::new(self.cached_next_free_ids[0].load(atomic::Ordering::SeqCst)),
-                AtomicU64::new(self.cached_next_free_ids[1].load(atomic::Ordering::SeqCst)),
-            ],
-        }
-    }
-}
-
-/// Return value of `assign_head`.
-#[derive(Debug, Default)]
-pub struct AssignHeadOutcome {
-    /// New flat segments.
-    pub segments: Vec<FlatSegment>,
-}
-
-impl AssignHeadOutcome {
-    /// The id of the head.
-    pub fn head_id(&self) -> Option<Id> {
-        self.segments.last().map(|s| s.high)
-    }
-
-    /// Merge with another (newer) `AssignHeadOutcome`.
-    pub fn merge(&mut self, rhs: Self) {
-        if rhs.segments.is_empty() {
-            return;
-        }
-        if self.segments.is_empty() {
-            *self = rhs;
-            return;
-        }
-
-        // sanity check: should be easy to verify - next_free_id provides
-        // incremental ids.
-        debug_assert!(self.segments.last().unwrap().high < rhs.segments[0].low);
-
-        // NOTE: Consider merging segments for slightly better perf.
-        self.segments.extend(rhs.segments);
-    }
-
-    /// Add graph edges: id -> parent_ids. Used by `assign_head`.
-    fn push_edge(&mut self, id: Id, parent_ids: &[Id]) {
-        let new_seg = || FlatSegment {
-            low: id,
-            high: id,
-            parents: parent_ids.to_vec(),
-        };
-
-        // sanity check: this should be easy to verify - assign_head gets new ids
-        // by `next_free_id()`, which should be incremental.
-        debug_assert!(
-            self.segments.last().map_or(Id(0), |s| s.high + 1) < id + 1,
-            "push_edge(id={}, parent_ids={:?}) called out of order ({:?})",
-            id,
-            parent_ids,
-            self
-        );
-
-        if parent_ids.len() != 1 || parent_ids[0] + 1 != id {
-            // Start a new segment.
-            self.segments.push(new_seg());
-        } else {
-            // Try to reuse the existing last segment.
-            if let Some(seg) = self.segments.last_mut() {
-                if seg.high + 1 == id {
-                    seg.high = id;
-                } else {
-                    self.segments.push(new_seg());
-                }
-            } else {
-                self.segments.push(new_seg());
-            }
-        }
-    }
-
-    #[cfg(test)]
-    /// Verify against a parent function. For testing only.
-    pub fn verify(&self, parent_func: impl Fn(Id) -> Result<Vec<Id>>) {
-        for seg in &self.segments {
-            assert_eq!(
-                parent_func(seg.low).unwrap(),
-                seg.parents,
-                "parents mismtach for {} ({:?})",
-                seg.low,
-                &self
-            );
-            for id in (seg.low + 1).0..=seg.high.0 {
-                let id = Id(id);
-                assert_eq!(
-                    parent_func(id).unwrap(),
-                    vec![id - 1],
-                    "parents mismatch for {} ({:?})",
-                    id,
-                    &self
-                );
-            }
-        }
-    }
-}
-
-/// Used as part of `AssignedIds`.
-#[derive(Debug)]
-pub struct FlatSegment {
-    pub low: Id,
-    pub high: Id,
-    pub parents: Vec<Id>,
-}
+#[cfg(any(test, feature = "indexedlog-backend"))]
+pub use indexedlog_idmap::IdMap;
+pub(crate) use mem_idmap::CoreMemIdMap;
+pub use mem_idmap::MemIdMap;
 
 /// DAG-aware write operations.
+#[async_trait::async_trait]
 pub trait IdMapAssignHead: IdConvert + IdMapWrite {
     /// Assign an id for a head in a DAG. This implies ancestors of the
     /// head will also have ids assigned.
@@ -486,15 +49,25 @@ pub trait IdMapAssignHead: IdConvert + IdMapWrite {
     /// New `id`s inserted by this function will have the specified `group`.
     /// Existing `id`s that are ancestors of `head` will get re-assigned
     /// if they have a higher `group`.
-    fn assign_head<F>(
+    ///
+    /// `covered_ids` specifies what ranges of `Id`s are already covered.
+    /// This is usually obtained from `IdDag::all_ids_in_groups(&Group::ALL)`.
+    /// `IdMap` itself might not be able to provide that information
+    /// efficiently because it might be lazy. `covered_ids` will be updated
+    /// to cover newly inserted `Id`s.
+    ///
+    /// `reserved_ids` specifies what ranges are reserved for future growth
+    /// of other important heads (usually a couple of mainline branches that
+    /// are long-lived, growing, and used by many people). This is useful
+    /// to reduce fragmentation.
+    async fn assign_head(
         &mut self,
         head: VertexName,
-        parents_by_name: F,
+        parents_by_name: &dyn Parents,
         group: Group,
-    ) -> Result<AssignHeadOutcome>
-    where
-        F: Fn(VertexName) -> Result<Vec<VertexName>>,
-    {
+        covered_ids: &mut IdSet,
+        reserved_ids: &IdSet,
+    ) -> Result<PreparedFlatSegments> {
         // There are some interesting cases to optimize the numbers:
         //
         // C     For a merge C, it has choice to assign numbers to A or B
@@ -530,67 +103,226 @@ pub trait IdMapAssignHead: IdConvert + IdMapWrite {
         //
         // The code below is optimized for cases where p1 branch is linear,
         // but p2 branch is not.
-        let mut outcome = AssignHeadOutcome::default();
+        //
+        // However, the above visit order (first parent last) is not optimal
+        // for incremental build case with pushrebase branches. Because
+        // pushrebase uses the first parent as the mainline. For example:
+        //
+        //    A---B---C-...-D---M  (parents(M) = [D, F])
+        //                     /
+        //              E-...-F
+        //
+        // The A ... M branch is the mainline. The head of the mainline
+        // was A ... D, then M. An incremental build job might have built up
+        // A, B, ..., D before it sees M. In this case it's better to make
+        // the incremental build finish the A ... D part before jumping to
+        // E ... F.
+        //
+        // We choose first parent last order if `covered` is empty, or when
+        // visiting ancestors of non-first parents.
+        let mut outcome = PreparedFlatSegments::default();
+
+        #[derive(Copy, Clone, Debug)]
+        enum VisitOrder {
+            /// Visit the first parent first.
+            FirstFirst,
+            /// Visit the first parent last.
+            FirstLast,
+        }
 
         // Emulate the stack in heap to avoid overflow.
         #[derive(Debug)]
         enum Todo {
             /// Visit parents. Finally assign self. This will eventually turn into AssignedId.
-            Visit(VertexName),
+            Visit {
+                head: VertexName,
 
-            /// Assign a number if not assigned. Parents are visited.
-            /// The `usize` provides the length of parents.
-            Assign(VertexName, usize),
+                /// The `Id` in `IdMap` that is known assigned to the `head`.
+                /// This can be non-`None` if `IdMap` has more entries than `IdDag`.
+                known_id: Option<Id>,
+
+                order: VisitOrder,
+            },
+
+            /// Assign an `Id` if not assigned. Their parents are prepared in the
+            /// `parent_ids` stack. `Assign` `head` and `Visit` `head`'s parents
+            /// are pushed together so the `Visit` entries can turn into `Id`s in
+            /// the `parent_ids` stack.
+            Assign {
+                /// The vertex to assign. Its parents are already visited and assigned.
+                head: VertexName,
+
+                /// The `Id` in `IdMap` that is known assigned to the `head`.
+                /// This can be non-`None` if `IdMap` has more entries than `IdDag`.
+                known_id: Option<Id>,
+
+                /// The number of parents, at the end of the `parent_ids`.
+                parent_len: usize,
+
+                /// The order of parents if extracted from `parent_ids`.
+                order: VisitOrder,
+            },
 
             /// Assigned Id. Will be picked by and pushed to the current `parent_ids` stack.
-            AssignedId(Id),
+            AssignedId { id: Id },
         }
-        use Todo::{Assign, AssignedId, Visit};
+        use Todo::Assign;
+        use Todo::AssignedId;
+        use Todo::Visit;
         let mut parent_ids: Vec<Id> = Vec::new();
 
-        let mut todo_stack: Vec<Todo> = vec![Visit(head.clone())];
+        let mut todo_stack: Vec<Todo> = {
+            let order = if covered_ids.is_empty() {
+                // Assume re-building from scratch.
+                VisitOrder::FirstLast
+            } else {
+                // Assume incremental updates with pushrebase.
+                VisitOrder::FirstFirst
+            };
+            vec![Visit {
+                head: head.clone(),
+                known_id: None,
+                order,
+            }]
+        };
         while let Some(todo) = todo_stack.pop() {
+            tracing::trace!(target: "dag::assign", "todo: {:?}", &todo);
             match todo {
-                Visit(head) => {
+                Visit {
+                    head,
+                    known_id,
+                    order,
+                } => {
                     // If the id was not assigned, or was assigned to a higher group,
                     // (re-)assign it to this group.
-                    match self.vertex_id_with_max_group(&head, group)? {
-                        None => {
-                            let parents = parents_by_name(head.clone())?;
-                            todo_stack.push(Todo::Assign(head, parents.len()));
-                            // If the parent was not assigned, or was assigned to a higher group,
-                            // (re-)assign the parent to this group.
-                            // "rev" is the "optimization"
-                            for p in parents.into_iter().rev() {
-                                match self.vertex_id_with_max_group(&p, group) {
-                                    Ok(Some(id)) => todo_stack.push(Todo::AssignedId(id)),
-                                    _ => todo_stack.push(Todo::Visit(p)),
+                    //
+                    // PERF: This might trigger remote fetch too frequently.
+                    let known_id = match known_id {
+                        Some(id) => Some(id),
+                        None => self.vertex_id_with_max_group(&head, group).await?,
+                    };
+                    match known_id {
+                        Some(id) if covered_ids.contains(id) => todo_stack.push(AssignedId { id }),
+                        _ => {
+                            let parents = parents_by_name.parent_names(head.clone()).await?;
+                            tracing::trace!(target: "dag::assign", "visit {:?} ({:?}) with parents {:?}", &head, known_id, &parents);
+                            todo_stack.push(Assign {
+                                head,
+                                known_id,
+                                parent_len: parents.len(),
+                                order,
+                            });
+                            let mut visit = parents;
+                            match order {
+                                VisitOrder::FirstFirst => {}
+                                VisitOrder::FirstLast => visit.reverse(),
+                            }
+                            for (i, p) in visit.into_iter().enumerate() {
+                                // If the parent was not assigned, or was assigned to a higher group,
+                                // (re-)assign the parent to this group.
+                                match self.vertex_id_with_max_group(&p, group).await {
+                                    Ok(Some(id)) if covered_ids.contains(id) => {
+                                        todo_stack.push(AssignedId { id })
+                                    }
+                                    // Go deeper if IdMap has the entry but IdDag misses it.
+                                    Ok(Some(id)) => todo_stack.push(Visit {
+                                        head: p,
+                                        known_id: Some(id),
+                                        order,
+                                    }),
+                                    Ok(None) => {
+                                        let parent_order = match (order, i) {
+                                            (VisitOrder::FirstFirst, 0) => VisitOrder::FirstFirst,
+                                            _ => VisitOrder::FirstLast,
+                                        };
+                                        todo_stack.push(Visit {
+                                            head: p,
+                                            known_id: None,
+                                            order: parent_order,
+                                        })
+                                    }
+                                    Err(e) => return Err(e),
                                 }
                             }
                         }
-                        Some(id) => {
-                            // Inlined Assign(id, ...) -> AssignedId(id)
-                            parent_ids.push(id);
-                        }
                     }
                 }
-                Assign(head, parent_len) => {
+                Assign {
+                    head,
+                    known_id,
+                    parent_len,
+                    order,
+                } => {
                     let parent_start = parent_ids.len() - parent_len;
-                    let id = match self.vertex_id_with_max_group(&head, group)? {
-                        Some(id) => id,
-                        None => {
-                            let id = self.next_free_id(group)?;
-                            self.insert(id, head.as_ref())?;
-                            let parents = &parent_ids[parent_start..];
-                            outcome.push_edge(id, parents);
+                    let known_id = match known_id {
+                        Some(id) => Some(id),
+                        None => self.vertex_id_with_max_group(&head, group).await?,
+                    };
+                    let id = match known_id {
+                        Some(id) if covered_ids.contains(id) => id,
+                        _ => {
+                            let parents = match order {
+                                VisitOrder::FirstLast => Cow::Borrowed(&parent_ids[parent_start..]),
+                                VisitOrder::FirstFirst => Cow::Owned(
+                                    parent_ids[parent_start..]
+                                        .iter()
+                                        .cloned()
+                                        .rev()
+                                        .collect::<Vec<_>>(),
+                                ),
+                            };
+                            let id = match known_id {
+                                Some(id) => id,
+                                None => {
+                                    let candidate_id = match parents.iter().max() {
+                                        Some(&max_parent_id) => {
+                                            (max_parent_id + 1).max(group.min_id())
+                                        }
+                                        None => group.min_id(),
+                                    };
+                                    adjust_candidate_id(
+                                        self,
+                                        covered_ids,
+                                        reserved_ids,
+                                        candidate_id,
+                                    )
+                                    .await?
+                                }
+                            };
+                            if id.group() != group {
+                                return Err(Error::IdOverflow(group));
+                            }
+                            covered_ids.push(id);
+                            if known_id.is_none() {
+                                tracing::trace!(target: "dag::assign", "assign {:?} = {:?}", &head, id);
+                                self.insert(id, head.as_ref()).await?;
+                            } else {
+                                tracing::trace!(target: "dag::assign", "assign {:?} = {:?} (known)", &head, id);
+                            }
+                            if parents.iter().any(|&p| p >= id) {
+                                return bug(format!(
+                                    "IdMap Ids are not topo-sorted: {:?} ({:?}) has parent ids {:?}",
+                                    id, head, &parents,
+                                ));
+                            }
+                            outcome.push_edge(id, &parents);
                             id
                         }
                     };
                     parent_ids.truncate(parent_start);
-                    // Inlined AssignId(id);
-                    parent_ids.push(id);
+                    todo_stack.push(AssignedId { id });
                 }
-                AssignedId(id) => {
+                AssignedId { id } => {
+                    if !covered_ids.contains(id) {
+                        return bug(format!(
+                            concat!(
+                                "attempted to assign id with wrong order: {:?} ",
+                                "is being pushed as parent id but it cannot be used ",
+                                "because it is not yet covered by IdDag",
+                            ),
+                            &id
+                        ));
+                    }
                     parent_ids.push(id);
                 }
             }
@@ -600,250 +332,132 @@ pub trait IdMapAssignHead: IdConvert + IdMapWrite {
     }
 }
 
+/// Pick a minimal `n`, so `candidate_id + n` is an `Id` that is not "covered",
+/// not "reserved", and not in the "map".  Return the picked `Id`.
+async fn adjust_candidate_id(
+    map: &(impl IdConvert + ?Sized),
+    covered_ids: &IdSet,
+    reserved_ids: &IdSet,
+    mut candidate_id: Id,
+) -> Result<Id> {
+    loop {
+        // (Fast) test using covered_ids + reserved_ids.
+        loop {
+            if let Some(span) = covered_ids.span_contains(candidate_id) {
+                candidate_id = span.high + 1;
+                continue;
+            }
+            if let Some(span) = reserved_ids.span_contains(candidate_id) {
+                candidate_id = span.high + 1;
+                continue;
+            }
+            break;
+        }
+        // (Slow) test using the IdMap.
+        let new_candidate_id = ensure_id_not_exist_in_map(map, candidate_id).await?;
+        if new_candidate_id == candidate_id {
+            break;
+        } else {
+            // Check the covered_ids + reserved_ids.
+            candidate_id = new_candidate_id;
+        }
+    }
+    Ok(candidate_id)
+}
+
+/// Pick a minimal `n`, so `candidate_id + n` is an `Id` that is not in the
+/// "map". Return the picked `Id`.
+async fn ensure_id_not_exist_in_map(
+    map: &(impl IdConvert + ?Sized),
+    mut candidate_id: Id,
+) -> Result<Id> {
+    // PERF: This lacks of batching if it forms a loop. But it
+    // is also expected to be rare - only when the server
+    // tailer (assuming only one tailer is writing globally) is
+    // killed abnormally, *and* the branch being assigned has
+    // non-fast-forward move, this code path becomes useful.
+    //
+    // Technically, not using `locally` is more correct in a
+    // lazy `IdMap`. However, lazy `IdMap` is only used by
+    // client (local) dag, which ensures `IdMap` and `IdDag`
+    // are in-sync, meaning that the above `covered_ids` check
+    // is sufficient. So this is really only protecting the
+    // server's out-of-sync `IdMap` use-case, where the
+    // `locally` variant is the same as the non-`locally`,
+    // since the server has a non-lazy `IdMap`.
+    while let [true] = &map.contains_vertex_id_locally(&[candidate_id]).await?[..] {
+        candidate_id = candidate_id + 1;
+    }
+    Ok(candidate_id)
+}
+
 impl<T> IdMapAssignHead for T where T: IdConvert + IdMapWrite {}
 
-pub trait IdMapBuildParents: IdConvert {
-    /// Translate `get_parents` from taking names to taking `Id`s.
-    fn build_get_parents_by_id<'a>(
-        &'a self,
-        get_parents_by_name: &'a dyn Fn(VertexName) -> Result<Vec<VertexName>>,
-    ) -> Box<dyn Fn(Id) -> Result<Vec<Id>> + 'a> {
-        let func = move |id: Id| -> Result<Vec<Id>> {
-            let name = self.vertex_name(id)?;
-            let parent_names: Vec<VertexName> = get_parents_by_name(name.clone())?;
-            let mut result = Vec::with_capacity(parent_names.len());
-            for parent_name in parent_names {
-                let parent_id = self.vertex_id(parent_name)?;
-                if parent_id >= id {
-                    return programming(format!(
-                        "parent {} {:?} should <= {} {:?}",
-                        parent_id,
-                        self.vertex_name(parent_id)?,
-                        id,
-                        &name
-                    ));
-                };
-                result.push(parent_id);
-            }
-            Ok(result)
-        };
-        Box::new(func)
-    }
-}
-
-impl<T> IdMapBuildParents for T where T: IdConvert {}
-
-// Remove data.
-impl IdMap {
-    /// Mark non-master ids as "removed".
-    pub fn remove_non_master(&mut self) -> Result<()> {
-        self.log.append(IdMap::MAGIC_CLEAR_NON_MASTER)?;
-        self.need_rebuild_non_master = false;
-        // Invalidate the next free id cache.
-        self.cached_next_free_ids = Default::default();
-        if self.next_free_id(Group::NON_MASTER)? != Group::NON_MASTER.min_id() {
-            return bug("remove_non_master did not take effect");
-        }
-        Ok(())
-    }
-}
-
-impl<'a> SyncableIdMap<'a> {
-    /// Write pending changes to disk.
-    pub fn sync(&mut self) -> Result<()> {
-        if self.need_rebuild_non_master {
-            return bug("cannot sync with re-assigned ids unresolved");
-        }
-        self.map.log.sync()?;
-        Ok(())
-    }
-}
-
-impl fmt::Debug for IdMap {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "IdMap {{\n")?;
-        for data in self.log.iter() {
-            if let Ok(mut data) = data {
-                let id = data.read_u64::<BigEndian>().unwrap();
-                let _group = data.read_u8().unwrap();
-                let mut name = Vec::with_capacity(20);
-                data.read_to_end(&mut name).unwrap();
-                let name = if name.len() >= 20 {
-                    VertexName::from(name).to_hex()
-                } else {
-                    String::from_utf8_lossy(&name).to_string()
-                };
-                let id = Id(id);
-                write!(f, "  {}: {},\n", name, id)?;
-            }
-        }
-        write!(f, "}}\n")?;
-        Ok(())
-    }
-}
-
-impl<'a> Deref for SyncableIdMap<'a> {
-    type Target = IdMap;
-
-    fn deref(&self) -> &Self::Target {
-        self.map
-    }
-}
-
-impl<'a> DerefMut for SyncableIdMap<'a> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.map
-    }
-}
-
-/// Minimal write operations for IdMap.
+/// Write operations for IdMap.
+#[async_trait::async_trait]
 pub trait IdMapWrite {
-    fn insert(&mut self, id: Id, name: &[u8]) -> Result<()>;
-    fn next_free_id(&self, group: Group) -> Result<Id>;
-}
-
-impl IdConvert for IdMap {
-    fn vertex_id(&self, name: VertexName) -> Result<Id> {
-        self.find_id_by_name(name.as_ref())?
-            .ok_or_else(|| name.not_found_error())
-    }
-    fn vertex_id_with_max_group(&self, name: &VertexName, max_group: Group) -> Result<Option<Id>> {
-        self.find_id_by_name_with_max_group(name.as_ref(), max_group)
-    }
-    fn vertex_name(&self, id: Id) -> Result<VertexName> {
-        self.find_vertex_name_by_id(id)?
-            .ok_or_else(|| id.not_found_error())
-    }
-    fn contains_vertex_name(&self, name: &VertexName) -> Result<bool> {
-        Ok(self.find_id_by_name(name.as_ref())?.is_some())
-    }
-}
-
-impl IdMapWrite for IdMap {
-    fn insert(&mut self, id: Id, name: &[u8]) -> Result<()> {
-        IdMap::insert(self, id, name)
-    }
-    fn next_free_id(&self, group: Group) -> Result<Id> {
-        IdMap::next_free_id(self, group)
-    }
-}
-
-impl IdConvert for MemIdMap {
-    fn vertex_id(&self, name: VertexName) -> Result<Id> {
-        let id = self
-            .name2id
-            .get(&name)
-            .ok_or_else(|| name.not_found_error())?;
-        Ok(*id)
-    }
-    fn vertex_id_with_max_group(&self, name: &VertexName, max_group: Group) -> Result<Option<Id>> {
-        let optional_id = self.name2id.get(name).and_then(|id| {
-            if id.group() <= max_group {
-                Some(*id)
-            } else {
-                None
-            }
-        });
-        Ok(optional_id)
-    }
-    fn vertex_name(&self, id: Id) -> Result<VertexName> {
-        let name = self.id2name.get(&id).ok_or_else(|| id.not_found_error())?;
-        Ok(name.clone())
-    }
-    fn contains_vertex_name(&self, name: &VertexName) -> Result<bool> {
-        Ok(self.name2id.contains_key(name))
-    }
-}
-
-impl IdMapWrite for MemIdMap {
-    fn insert(&mut self, id: Id, name: &[u8]) -> Result<()> {
-        let vertex_name = VertexName::copy_from(name);
-        self.name2id.insert(vertex_name.clone(), id);
-        self.id2name.insert(id, vertex_name);
-        let group = id.group();
-        // TODO: use fetch_max once stabilized.
-        // (https://github.com/rust-lang/rust/issues/4865)
-        let cached = self.cached_next_free_ids[group.0].load(atomic::Ordering::SeqCst);
-        if id.0 >= cached {
-            self.cached_next_free_ids[group.0].store(id.0 + 1, atomic::Ordering::SeqCst);
-        }
-        Ok(())
-    }
-    fn next_free_id(&self, group: Group) -> Result<Id> {
-        let cached = self.cached_next_free_ids[group.0].load(atomic::Ordering::SeqCst);
-        let id = Id(cached);
-        Ok(id)
-    }
-}
-
-impl PrefixLookup for IdMap {
-    fn vertexes_by_hex_prefix(&self, hex_prefix: &[u8], limit: usize) -> Result<Vec<VertexName>> {
-        self.find_names_by_hex_prefix(hex_prefix, limit)
-    }
-}
-
-impl PrefixLookup for MemIdMap {
-    fn vertexes_by_hex_prefix(&self, hex_prefix: &[u8], limit: usize) -> Result<Vec<VertexName>> {
-        let start = VertexName::from_hex(hex_prefix)?;
-        let mut result = Vec::new();
-        for (vertex, _) in self.name2id.range(start..) {
-            if !vertex.to_hex().as_bytes().starts_with(hex_prefix) {
-                break;
-            }
-            result.push(vertex.clone());
-            if result.len() >= limit {
-                break;
-            }
-        }
-        Ok(result)
-    }
+    /// Insert a new `(id, name)` pair to the map.
+    ///
+    /// The `id` and `name` mapping should be unique, it's an error to map an id
+    /// to multiple names, or map a name to multiple ids. Note: older versions
+    /// of `IdMap` allowed mapping a name to a non-master Id, then a master Id
+    /// (in this order), and the master Id is used for lookups. This is no
+    /// longer permitted.
+    async fn insert(&mut self, id: Id, name: &[u8]) -> Result<()>;
+    /// Remove ids in the range `low..=high` and their associated names.
+    /// Return removed names.
+    async fn remove_range(&mut self, low: Id, high: Id) -> Result<Vec<VertexName>>;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use nonblocking::non_blocking_result as r;
+    #[cfg(feature = "indexedlog-backend")]
     use tempfile::tempdir;
 
+    use super::*;
+    #[cfg(feature = "indexedlog-backend")]
+    use crate::ops::Persist;
+    #[cfg(feature = "indexedlog-backend")]
+    use crate::ops::PrefixLookup;
+
+    #[cfg(feature = "indexedlog-backend")]
     #[test]
     fn test_basic_operations() {
         let dir = tempdir().unwrap();
         let mut map = IdMap::open(dir.path()).unwrap();
-        let mut map = map.prepare_filesystem_sync().unwrap();
-        assert_eq!(map.next_free_id(Group::MASTER).unwrap().0, 0);
+        let lock = map.lock().unwrap();
+        map.reload(&lock).unwrap();
         map.insert(Id(1), b"abc").unwrap();
-        assert_eq!(map.next_free_id(Group::MASTER).unwrap().0, 2);
         map.insert(Id(2), b"def").unwrap();
-        assert_eq!(map.next_free_id(Group::MASTER).unwrap().0, 3);
         map.insert(Id(10), b"ghi").unwrap();
-        assert_eq!(map.next_free_id(Group::MASTER).unwrap().0, 11);
         map.insert(Id(11), b"ghi").unwrap_err(); // ghi maps to 10
         map.insert(Id(10), b"ghi2").unwrap_err(); // 10 maps to ghi
 
         // Test another group.
-        let id = map.next_free_id(Group::NON_MASTER).unwrap();
+        let id = Group::NON_MASTER.min_id();
         map.insert(id, b"jkl").unwrap();
         map.insert(id, b"jkl").unwrap();
         map.insert(id, b"jkl2").unwrap_err(); // id maps to jkl
         map.insert(id + 1, b"jkl2").unwrap();
         map.insert(id + 2, b"jkl2").unwrap_err(); // jkl2 maps to id + 1
-        map.insert(Id(15), b"jkl2").unwrap(); // reassign jkl2 to master group - ok.
+        map.insert(Id(15), b"jkl2").unwrap_err(); // reassign jkl2 to master group - error.
         map.insert(id + 3, b"abc").unwrap_err(); // reassign abc to non-master group - error.
-        assert_eq!(map.next_free_id(Group::NON_MASTER).unwrap(), id + 2);
 
         // Test hex lookup.
         assert_eq!(0x6a, b'j');
         assert_eq!(
-            map.vertexes_by_hex_prefix(b"6a", 3).unwrap(),
+            r(map.vertexes_by_hex_prefix(b"6a", 3)).unwrap(),
             [
                 VertexName::from(&b"jkl"[..]),
                 VertexName::from(&b"jkl2"[..])
             ]
         );
         assert_eq!(
-            map.vertexes_by_hex_prefix(b"6a", 1).unwrap(),
+            r(map.vertexes_by_hex_prefix(b"6a", 1)).unwrap(),
             [VertexName::from(&b"jkl"[..])]
         );
-        assert!(map.vertexes_by_hex_prefix(b"6b", 1).unwrap().is_empty());
+        assert!(r(map.vertexes_by_hex_prefix(b"6b", 1)).unwrap().is_empty());
 
         for _ in 0..=1 {
             assert_eq!(map.find_name_by_id(Id(1)).unwrap().unwrap(), b"abc");
@@ -855,25 +469,120 @@ mod tests {
             assert_eq!(map.find_id_by_name(b"def").unwrap().unwrap().0, 2);
             assert_eq!(map.find_id_by_name(b"ghi").unwrap().unwrap().0, 10);
             assert_eq!(map.find_id_by_name(b"jkl").unwrap().unwrap(), id);
-            assert_eq!(map.find_id_by_name(b"jkl2").unwrap().unwrap().0, 15);
+            assert_eq!(
+                format!("{:?}", map.find_id_by_name(b"jkl2").unwrap().unwrap()),
+                "N1"
+            );
             assert!(map.find_id_by_name(b"jkl3").unwrap().is_none());
-            // HACK: allow sync with re-assigned ids.
-            map.need_rebuild_non_master = false;
-            map.sync().unwrap();
         }
 
         // Test Debug
         assert_eq!(
-            format!("{:?}", map.deref()),
+            format!("{:?}", &map),
             r#"IdMap {
   abc: 1,
   def: 2,
   ghi: 10,
   jkl: N0,
   jkl2: N1,
-  jkl2: 15,
 }
 "#
         );
+    }
+
+    #[test]
+    fn test_remove_range() {
+        let map = MemIdMap::new();
+        check_remove_range(map);
+
+        #[cfg(feature = "indexedlog-backend")]
+        {
+            let dir = tempdir().unwrap();
+            let path = dir.path();
+            let map = IdMap::open(path).unwrap();
+            check_remove_range(map);
+        }
+    }
+
+    fn check_remove_range(mut map: impl IdConvert + IdMapWrite) {
+        let items: &[(Id, &[u8])] = &[
+            (Id(0), b"z"),
+            (Id(1), b"a"),
+            (Id(2), b"bbb"),
+            (Id(3), b"bb"),
+            (Id(4), b"cc"),
+            (Id(5), b"ccc"),
+            (Id(9), b"ddd"),
+            (Id(11), b"e"),
+            (Id(13), b"ff"),
+            (nid(0), b"n"),
+            (nid(1), b"n1"),
+            (nid(2), b"n2"),
+            (nid(3), b"n3"),
+            (nid(4), b"n4"),
+            (nid(5), b"n5"),
+            (nid(12), b"n12"),
+            (nid(20), b"n20"),
+        ];
+        for (id, name) in items {
+            r(map.insert(*id, name)).unwrap();
+        }
+
+        // deleted ids in a string, with extra consistency checks.
+        let deleted = |map: &dyn IdConvert| -> String {
+            let mut deleted_ids = Vec::new();
+            for (id, name) in items {
+                let name = VertexName::copy_from(name);
+                let id = *id;
+                let has_id = r(map.contains_vertex_id_locally(&[id])).unwrap()[0];
+                let lookup_id = r(map.vertex_id_optional(&name)).unwrap();
+                let lookup_name = if has_id {
+                    Some(r(map.vertex_name(id)).unwrap())
+                } else {
+                    None
+                };
+
+                match (lookup_id, lookup_name) {
+                    (None, None) => deleted_ids.push(id),
+                    (None, Some(_)) => {
+                        panic!("name->id deleted but not id->name: ({:?} {:?})", id, name)
+                    }
+                    (Some(_), None) => {
+                        panic!("id->name deleted but not name->id: ({:?} {:?})", id, name)
+                    }
+                    (Some(lid), Some(lname)) => {
+                        assert_eq!(lid, id);
+                        assert_eq!(lname, name);
+                    }
+                }
+            }
+            format!("{:?}", deleted_ids)
+        };
+
+        let f = |vs: Vec<VertexName>| -> String {
+            let mut vs = vs;
+            vs.sort_unstable();
+            format!("{:?}", vs)
+        };
+
+        let removed = r(map.remove_range(Id(1), Id(3))).unwrap();
+        assert_eq!(f(removed), "[a, bb, bbb]");
+        assert_eq!(deleted(&map), "[1, 2, 3]");
+
+        let removed = r(map.remove_range(Id(8), Id(12))).unwrap();
+        assert_eq!(f(removed), "[ddd, e]");
+        assert_eq!(deleted(&map), "[1, 2, 3, 9, 11]");
+
+        let removed = r(map.remove_range(nid(2), nid(4))).unwrap();
+        assert_eq!(f(removed), "[n2, n3, n4]");
+        assert_eq!(deleted(&map), "[1, 2, 3, 9, 11, N2, N3, N4]");
+
+        let removed = r(map.remove_range(nid(20), nid(10000))).unwrap();
+        assert_eq!(f(removed), "[n20]");
+        assert_eq!(deleted(&map), "[1, 2, 3, 9, 11, N2, N3, N4, N20]");
+    }
+
+    fn nid(i: u64) -> Id {
+        Group::NON_MASTER.min_id() + i
     }
 }

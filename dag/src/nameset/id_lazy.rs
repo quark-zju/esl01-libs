@@ -1,24 +1,32 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
+
+use std::any::Any;
+use std::fmt;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+
+use indexmap::IndexSet;
+use nonblocking::non_blocking_result;
 
 use super::hints::Flags;
 use super::id_static::IdStaticSet;
-use super::{Hints, NameIter, NameSetQuery};
+use super::AsyncNameSetQuery;
+use super::BoxVertexStream;
+use super::Hints;
 use crate::ops::DagAlgorithm;
 use crate::ops::IdConvert;
-use crate::spanset::SpanSet;
+use crate::protocol::disable_remote_protocol;
 use crate::Group;
 use crate::Id;
+use crate::IdSet;
 use crate::Result;
 use crate::VertexName;
-use indexmap::IndexSet;
-use std::any::Any;
-use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard};
 
 /// A set backed by a lazy iterator of Ids.
 pub struct IdLazySet {
@@ -76,33 +84,48 @@ pub struct Iter {
     map: Arc<dyn IdConvert + Send + Sync>,
 }
 
-impl Iterator for Iter {
-    type Item = Result<VertexName>;
+impl Iter {
+    fn into_box_stream(self) -> BoxVertexStream {
+        Box::pin(futures::stream::unfold(self, |this| this.next()))
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut inner = self.inner.lock().unwrap();
+    async fn next(mut self) -> Option<(Result<VertexName>, Self)> {
         loop {
-            match inner.state {
+            let state = {
+                let inner = self.inner.lock().unwrap();
+                inner.state
+            };
+            match state {
                 State::Error => break None,
-                State::Complete if inner.visited.len() <= self.index => break None,
+                State::Complete if self.inner.lock().unwrap().visited.len() <= self.index => {
+                    break None;
+                }
                 State::Complete | State::Incomplete => {
-                    match inner.visited.get_index(self.index) {
-                        Some(&id) => {
+                    let opt_id = {
+                        let inner = self.inner.lock().unwrap();
+                        inner.visited.get_index(self.index).cloned()
+                    };
+                    match opt_id {
+                        Some(id) => {
                             self.index += 1;
-                            match self.map.vertex_name(id) {
+                            match self.map.vertex_name(id).await {
                                 Err(err) => {
-                                    inner.state = State::Error;
-                                    return Some(Err(err));
+                                    self.inner.lock().unwrap().state = State::Error;
+                                    return Some((Err(err), self));
                                 }
                                 Ok(vertex) => {
-                                    break Some(Ok(vertex));
+                                    break Some((Ok(vertex), self));
                                 }
                             }
                         }
                         None => {
                             // Data not available. Load more.
-                            if let Err(err) = inner.load_more(1, None) {
-                                return Some(Err(err));
+                            let more = {
+                                let mut inner = self.inner.lock().unwrap();
+                                inner.load_more(1, None)
+                            };
+                            if let Err(err) = more {
+                                return Some((Err(err), self));
                             }
                         }
                     }
@@ -137,14 +160,16 @@ impl fmt::Debug for IdLazySet {
         f.debug_list()
             .entries(inner.visited.iter().take(limit).map(|&id| DebugId {
                 id,
-                name: self.map.vertex_name(id).ok(),
+                name: disable_remote_protocol(|| {
+                    non_blocking_result(self.map.vertex_name(id)).ok()
+                }),
             }))
             .finish()?;
         let remaining = inner.visited.len().max(limit) - limit;
         match (remaining, inner.state) {
             (0, State::Incomplete) => f.write_str(" + ? more")?,
             (n, State::Incomplete) => write!(f, "+ {} + ? more", n)?,
-            (0, _) => (),
+            (0, _) => {}
             (n, _) => write!(f, " + {} more", n)?,
         }
         f.write_str(">")?;
@@ -180,7 +205,7 @@ impl IdLazySet {
     /// Convert to an IdStaticSet.
     pub fn to_static(&self) -> Result<IdStaticSet> {
         let inner = self.load_all()?;
-        let mut spans = SpanSet::empty();
+        let mut spans = IdSet::empty();
         for &id in inner.visited.iter() {
             spans.push(id);
         }
@@ -198,8 +223,9 @@ impl IdLazySet {
     }
 }
 
-impl NameSetQuery for IdLazySet {
-    fn iter(&self) -> Result<Box<dyn NameIter>> {
+#[async_trait::async_trait]
+impl AsyncNameSetQuery for IdLazySet {
+    async fn iter(&self) -> Result<BoxVertexStream> {
         let inner = self.inner.clone();
         let map = self.map.clone();
         let iter = Iter {
@@ -207,42 +233,61 @@ impl NameSetQuery for IdLazySet {
             index: 0,
             map,
         };
-        Ok(Box::new(iter))
+        Ok(iter.into_box_stream())
     }
 
-    fn iter_rev(&self) -> Result<Box<dyn NameIter>> {
+    async fn iter_rev(&self) -> Result<BoxVertexStream> {
         let inner = self.load_all()?;
-        let map = self.map.clone();
-        let iter = inner
-            .visited
-            .clone()
-            .into_iter()
-            .rev()
-            .map(move |id| map.vertex_name(id));
-        Ok(Box::new(iter) as Box<dyn NameIter>)
+        struct State {
+            map: Arc<dyn IdConvert + Send + Sync>,
+            iter: Box<dyn Iterator<Item = Id> + Send>,
+        }
+        let state = State {
+            map: self.map.clone(),
+            iter: Box::new(inner.visited.clone().into_iter().rev()),
+        };
+        async fn next(mut state: State) -> Option<(Result<VertexName>, State)> {
+            match state.iter.next() {
+                None => None,
+                Some(id) => {
+                    let result = state.map.vertex_name(id).await;
+                    Some((result, state))
+                }
+            }
+        }
+
+        let stream = futures::stream::unfold(state, next);
+        Ok(Box::pin(stream))
     }
 
-    fn count(&self) -> Result<usize> {
+    async fn count(&self) -> Result<usize> {
         let inner = self.load_all()?;
         Ok(inner.visited.len())
     }
 
-    fn last(&self) -> Result<Option<VertexName>> {
-        let inner = self.load_all()?;
-        match inner.visited.iter().rev().nth(0) {
-            Some(&id) => Ok(Some(self.map.vertex_name(id)?)),
+    async fn last(&self) -> Result<Option<VertexName>> {
+        let opt_id = {
+            let inner = self.load_all()?;
+            inner.visited.iter().rev().nth(0).cloned()
+        };
+        match opt_id {
+            Some(id) => Ok(Some(self.map.vertex_name(id).await?)),
             None => Ok(None),
         }
     }
 
-    fn contains(&self, name: &VertexName) -> Result<bool> {
-        let mut inner = self.inner.lock().unwrap();
-        let id = match self.map.vertex_id_with_max_group(name, Group::NON_MASTER)? {
+    async fn contains(&self, name: &VertexName) -> Result<bool> {
+        let id = match self
+            .map
+            .vertex_id_with_max_group(name, Group::NON_MASTER)
+            .await?
+        {
             None => {
                 return Ok(false);
             }
             Some(id) => id,
         };
+        let mut inner = self.inner.lock().unwrap();
         if inner.visited.contains(&id) {
             return Ok(true);
         } else {
@@ -275,6 +320,26 @@ impl NameSetQuery for IdLazySet {
         Ok(false)
     }
 
+    async fn contains_fast(&self, name: &VertexName) -> Result<Option<bool>> {
+        let id = match self
+            .map
+            .vertex_id_with_max_group(name, Group::NON_MASTER)
+            .await?
+        {
+            None => {
+                return Ok(Some(false));
+            }
+            Some(id) => id,
+        };
+        let inner = self.inner.lock().unwrap();
+        if inner.visited.contains(&id) {
+            return Ok(Some(true));
+        } else if inner.state != State::Incomplete {
+            return Ok(Some(false));
+        }
+        Ok(None)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -289,21 +354,84 @@ impl NameSetQuery for IdLazySet {
 }
 
 #[cfg(test)]
-#[allow(clippy::redundant_clone)]
-pub(crate) mod tests {
-    use super::super::tests::*;
-    use super::super::NameSet;
+pub(crate) mod test_utils {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering::AcqRel;
+
     use super::*;
+    use crate::ops::PrefixLookup;
     use crate::tests::dummy_dag::DummyDag;
-    use std::collections::HashSet;
-    use std::convert::TryInto;
+    use crate::VerLink;
+
+    static STR_ID_MAP_ID: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) struct StrIdMap {
+        id: String,
+        version: VerLink,
+    }
+
+    impl StrIdMap {
+        pub(crate) fn new() -> Self {
+            Self {
+                id: format!("str:{}", STR_ID_MAP_ID.fetch_add(1, AcqRel)),
+                version: VerLink::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PrefixLookup for StrIdMap {
+        async fn vertexes_by_hex_prefix(&self, _: &[u8], _: usize) -> Result<Vec<VertexName>> {
+            // Dummy implementation.
+            Ok(Vec::new())
+        }
+    }
+    #[async_trait::async_trait]
+    impl IdConvert for StrIdMap {
+        async fn vertex_id(&self, name: VertexName) -> Result<Id> {
+            let slice: [u8; 8] = name.as_ref().try_into().unwrap();
+            let id = u64::from_le(unsafe { std::mem::transmute(slice) });
+            Ok(Id(id))
+        }
+        async fn vertex_id_with_max_group(
+            &self,
+            name: &VertexName,
+            _max_group: Group,
+        ) -> Result<Option<Id>> {
+            if name.as_ref().len() == 8 {
+                let id = self.vertex_id(name.clone()).await?;
+                Ok(Some(id))
+            } else {
+                Ok(None)
+            }
+        }
+        async fn vertex_name(&self, id: Id) -> Result<VertexName> {
+            let buf: [u8; 8] = unsafe { std::mem::transmute(id.0.to_le()) };
+            Ok(VertexName::copy_from(&buf))
+        }
+        async fn contains_vertex_name(&self, name: &VertexName) -> Result<bool> {
+            Ok(name.as_ref().len() == 8)
+        }
+        fn map_id(&self) -> &str {
+            &self.id
+        }
+        fn map_version(&self) -> &VerLink {
+            &self.version
+        }
+        async fn contains_vertex_id_locally(&self, ids: &[Id]) -> Result<Vec<bool>> {
+            Ok(ids.iter().map(|_| true).collect())
+        }
+        async fn contains_vertex_name_locally(&self, names: &[VertexName]) -> Result<Vec<bool>> {
+            Ok(names.iter().map(|name| name.as_ref().len() == 8).collect())
+        }
+    }
 
     pub fn lazy_set(a: &[u64]) -> IdLazySet {
         let ids: Vec<Id> = a.iter().map(|i| Id(*i as _)).collect();
         IdLazySet::from_iter_idmap_dag(
             ids.into_iter().map(Ok),
-            Arc::new(StrIdMap),
-            Arc::new(DummyDag),
+            Arc::new(StrIdMap::new()),
+            Arc::new(DummyDag::new()),
         )
     }
 
@@ -311,46 +439,33 @@ pub(crate) mod tests {
         let ids: Vec<Id> = a.iter().map(|i| Id(*i as _)).collect();
         IdLazySet::from_iter_idmap_dag(ids.into_iter().map(Ok), set.map.clone(), set.dag.clone())
     }
+}
 
-    struct StrIdMap;
+#[cfg(all(test, feature = "indexedlog-backend"))]
+#[allow(clippy::redundant_clone)]
+pub(crate) mod tests {
+    use std::collections::HashSet;
 
-    impl IdConvert for StrIdMap {
-        fn vertex_id(&self, name: VertexName) -> Result<Id> {
-            let slice: [u8; 8] = name.as_ref().try_into().unwrap();
-            let id = u64::from_le(unsafe { std::mem::transmute(slice) });
-            Ok(Id(id))
-        }
-        fn vertex_id_with_max_group(
-            &self,
-            name: &VertexName,
-            _max_group: Group,
-        ) -> Result<Option<Id>> {
-            if name.as_ref().len() == 8 {
-                let id = self.vertex_id(name.clone())?;
-                Ok(Some(id))
-            } else {
-                Ok(None)
-            }
-        }
-        fn vertex_name(&self, id: Id) -> Result<VertexName> {
-            let buf: [u8; 8] = unsafe { std::mem::transmute(id.0.to_le()) };
-            Ok(VertexName::copy_from(&buf))
-        }
-        fn contains_vertex_name(&self, name: &VertexName) -> Result<bool> {
-            Ok(name.as_ref().len() == 8)
-        }
-    }
+    use nonblocking::non_blocking_result as r;
+
+    use super::super::tests::*;
+    use super::super::NameSet;
+    use super::test_utils::*;
+    use super::*;
 
     #[test]
     fn test_id_lazy_basic() -> Result<()> {
         let set = lazy_set(&[0x11, 0x33, 0x22, 0x77, 0x55]);
         check_invariants(&set)?;
-        assert_eq!(shorten_iter(set.iter()), ["11", "33", "22", "77", "55"]);
-        assert_eq!(shorten_iter(set.iter_rev()), ["55", "77", "22", "33", "11"]);
-        assert!(!set.is_empty()?);
-        assert_eq!(set.count()?, 5);
-        assert_eq!(shorten_name(set.first()?.unwrap()), "11");
-        assert_eq!(shorten_name(set.last()?.unwrap()), "55");
+        assert_eq!(shorten_iter(ni(set.iter())), ["11", "33", "22", "77", "55"]);
+        assert_eq!(
+            shorten_iter(ni(set.iter_rev())),
+            ["55", "77", "22", "33", "11"]
+        );
+        assert!(!nb(set.is_empty())?);
+        assert_eq!(nb(set.count())?, 5);
+        assert_eq!(shorten_name(nb(set.first())?.unwrap()), "11");
+        assert_eq!(shorten_name(nb(set.last())?.unwrap()), "55");
         Ok(())
     }
 
@@ -361,14 +476,14 @@ pub(crate) mod tests {
         // Incorrect hints, but useful for testing.
         set.hints().add_flags(Flags::ID_ASC);
 
-        let v = |i: u64| -> VertexName { StrIdMap.vertex_name(Id(i)).unwrap() };
-        assert!(set.contains(&v(0x20))?);
-        assert!(set.contains(&v(0x50))?);
-        assert!(!set.contains(&v(0x30))?);
+        let v = |i: u64| -> VertexName { r(StrIdMap::new().vertex_name(Id(i))).unwrap() };
+        assert!(nb(set.contains(&v(0x20)))?);
+        assert!(nb(set.contains(&v(0x50)))?);
+        assert!(!nb(set.contains(&v(0x30)))?);
 
         set.hints().add_flags(Flags::ID_DESC);
-        assert!(set.contains(&v(0x30))?);
-        assert!(!set.contains(&v(0x70))?);
+        assert!(nb(set.contains(&v(0x30)))?);
+        assert!(!nb(set.contains(&v(0x70)))?);
 
         Ok(())
     }
@@ -377,12 +492,12 @@ pub(crate) mod tests {
     fn test_debug() {
         let set = lazy_set(&[0]);
         assert_eq!(format!("{:?}", set), "<lazy [] + ? more>");
-        set.count().unwrap();
+        nb(set.count()).unwrap();
         assert_eq!(format!("{:?}", set), "<lazy [0000000000000000+0]>");
 
         let set = lazy_set(&[1, 3, 2]);
         assert_eq!(format!("{:?}", &set), "<lazy [] + ? more>");
-        let mut iter = set.iter().unwrap();
+        let mut iter = ni(set.iter()).unwrap();
         iter.next();
         assert_eq!(
             format!("{:?}", &set),
@@ -410,8 +525,8 @@ pub(crate) mod tests {
         // The first should be <static ...>, the second should be <spans ...>.
         let show = |set: NameSet| {
             [
-                format!("{:5.2?}", set.flatten_names().unwrap()),
-                format!("{:5.2?}", set.flatten().unwrap()),
+                format!("{:5.2?}", r(set.flatten_names()).unwrap()),
+                format!("{:5.2?}", r(set.flatten()).unwrap()),
             ]
         };
 
@@ -437,7 +552,7 @@ pub(crate) mod tests {
             let set = lazy_set(&a);
             check_invariants(&set).unwrap();
 
-            let count = set.count().unwrap();
+            let count = nb(set.count()).unwrap();
             assert!(count <= a.len());
 
             let set2: HashSet<_> = a.iter().cloned().collect();

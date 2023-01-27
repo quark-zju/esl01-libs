@@ -1,14 +1,17 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
+use std::io;
+
+use thiserror::Error;
+
+use crate::Group;
 use crate::Id;
 use crate::VertexName;
-use std::io;
-use thiserror::Error;
 
 /// Error used by the Dag crate.
 #[derive(Debug, Error)]
@@ -20,6 +23,10 @@ pub enum DagError {
     /// An Id cannot be found.
     #[error("{0:?} cannot be found")]
     IdNotFound(Id),
+
+    /// A fast path cannot be used.
+    #[error("NeedSlowPath: {0}")]
+    NeedSlowPath(String),
 
     /// Callsite does something wrong. For example, a "parent function" does not
     /// return reproducible results for a same vertex if called twice.
@@ -33,6 +40,10 @@ pub enum DagError {
     /// The backend (ex. filesystem) cannot fulfill the request somehow.
     #[error(transparent)]
     Backend(Box<BackendError>),
+
+    /// No space for new Ids.
+    #[error("out of space for group {0:?}")]
+    IdOverflow(Group),
 }
 
 #[derive(Debug, Error)]
@@ -43,6 +54,7 @@ pub enum BackendError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
+    #[cfg(any(test, feature = "indexedlog-backend"))]
     #[error(transparent)]
     IndexedLog(#[from] indexedlog::Error),
 
@@ -58,6 +70,7 @@ impl From<BackendError> for DagError {
     }
 }
 
+#[cfg(any(test, feature = "indexedlog-backend"))]
 impl From<indexedlog::Error> for DagError {
     fn from(err: indexedlog::Error) -> DagError {
         DagError::Backend(Box::new(BackendError::from(err)))
@@ -80,20 +93,24 @@ pub fn programming<T>(message: impl ToString) -> crate::Result<T> {
     Err(DagError::Programming(message.to_string()))
 }
 
-impl Id {
-    pub fn not_found_error(&self) -> DagError {
-        DagError::IdNotFound(self.clone())
-    }
-    pub fn not_found<T>(&self) -> crate::Result<T> {
+pub trait NotFoundError {
+    fn not_found_error(&self) -> DagError;
+
+    fn not_found<T>(&self) -> crate::Result<T> {
         Err(self.not_found_error())
     }
 }
 
-impl VertexName {
-    pub fn not_found_error(&self) -> DagError {
-        DagError::VertexNotFound(self.clone())
+impl NotFoundError for Id {
+    fn not_found_error(&self) -> DagError {
+        ::fail::fail_point!("dag-not-found-id");
+        DagError::IdNotFound(self.clone())
     }
-    pub fn not_found<T>(&self) -> crate::Result<T> {
-        Err(self.not_found_error())
+}
+
+impl NotFoundError for VertexName {
+    fn not_found_error(&self) -> DagError {
+        ::fail::fail_point!("dag-not-found-vertex");
+        DagError::VertexNotFound(self.clone())
     }
 }

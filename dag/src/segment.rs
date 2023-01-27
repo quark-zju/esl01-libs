@@ -1,41 +1,66 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 //! # segment
 //!
 //! Segmented DAG. See [`IdDag`] for the main structure.
-//!
-//! There are 2 flavors of DAG: [`IdDag`] and [`SyncableIdDag`]. [`IdDag`] loads
-//! from the filesystem, is responsible for all kinds of queires, and can
-//! have in-memory-only changes. [`SyncableIdDag`] is the only way to update
-//! the filesystem state, and does not support queires.
+
+use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::io::Cursor;
+
+use bitflags::bitflags;
+use byteorder::BigEndian;
+use byteorder::ByteOrder;
+use byteorder::ReadBytesExt;
+use byteorder::WriteBytesExt;
+pub use dag_types::segment::FlatSegment;
+pub use dag_types::segment::PreparedFlatSegments;
+use minibytes::Bytes;
+use serde::Deserialize;
+use serde::Serialize;
+use vlqencoding::VLQDecode;
+use vlqencoding::VLQDecodeAt;
+use vlqencoding::VLQEncode;
 
 use crate::errors::bug;
+use crate::errors::programming;
 use crate::id::Id;
-use crate::spanset::Span;
+use crate::IdSpan;
 use crate::Level;
 use crate::Result;
-use bitflags::bitflags;
-use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
-use minibytes::Bytes;
-use std::fmt::{self, Debug, Formatter};
-use std::io::Cursor;
-use vlqencoding::{VLQDecode, VLQDecodeAt, VLQEncode};
 
 /// [`Segment`] represents a range of [`Id`]s in an [`IdDag`] graph.
 /// It provides methods to access properties of the segments, including the range itself,
 /// parents, and level information.
-#[derive(Clone, Eq)]
+///
+/// This is the main struct used by the `dag` crate. It is mostly read from a store.
+/// Once read, it's immutable.
+#[derive(Clone, Eq, Serialize, Deserialize)]
 pub struct Segment(pub(crate) Bytes);
+
+/// In memory representation of a segment. Mostly useful for external use-cases.
+///
+/// Unlike `Segment`, it is not necessarily read from a store and can be
+/// constructed on the fly.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct IdSegment {
+    pub low: Id,
+    pub high: Id,
+    pub parents: Vec<Id>,
+    pub has_root: bool,
+    pub level: Level,
+}
 
 // Serialization format for Segment:
 //
 // ```plain,ignore
-// SEGMENT := LEVEL (1B) + HIGH (8B) + vlq(HIGH-LOW) + vlq(PARENT_COUNT) + vlq(VLQ, PARENTS)
+// SEGMENT := FLAG (1B) + LEVEL (1B) + HIGH (8B) + vlq(HIGH-LOW) + vlq(PARENT_COUNT) + vlq(VLQ, PARENTS)
 // ```
 //
 // The reason HIGH is not stored in VLQ is because it's used by range lookup,
@@ -49,6 +74,8 @@ bitflags! {
     pub struct SegmentFlags: u8 {
         /// This segment has roots (i.e. there is at least one id in
         /// `low..=high`, `parents(id)` is empty).
+        ///
+        /// This flag must be set correct for correctness.
         const HAS_ROOT = 0b1;
 
         /// This segment is the only head in `0..=high`.
@@ -56,6 +83,9 @@ bitflags! {
         ///
         /// This flag should not be set if the segment is either a high-level
         /// segment, or in a non-master group.
+        ///
+        /// This flag is an optimization. Not setting it might hurt performance
+        /// but not correctness.
         const ONLY_HEAD = 0b10;
     }
 }
@@ -94,7 +124,7 @@ impl Segment {
         Ok(len)
     }
 
-    pub(crate) fn span(&self) -> Result<Span> {
+    pub(crate) fn span(&self) -> Result<IdSpan> {
         let high = self.high()?;
         let delta = self.delta()?;
         let low = high - delta;
@@ -105,11 +135,23 @@ impl Segment {
         self.high()
     }
 
+    pub(crate) fn low(&self) -> Result<Id> {
+        Ok(self.span()?.low)
+    }
+
     pub(crate) fn level(&self) -> Result<Level> {
         match self.0.get(Self::OFFSET_LEVEL) {
             Some(level) => Ok(*level),
             None => bug("cannot read Segment::level"),
         }
+    }
+
+    pub(crate) fn parent_count(&self) -> Result<usize> {
+        let mut cur = Cursor::new(&self.0);
+        cur.set_position(Self::OFFSET_DELTA as u64);
+        let _: u64 = cur.read_vlq()?;
+        let parent_count: usize = cur.read_vlq()?;
+        Ok(parent_count)
     }
 
     pub(crate) fn parents(&self) -> Result<Vec<Id>> {
@@ -124,6 +166,20 @@ impl Segment {
         Ok(result)
     }
 
+    /// Duplicate the segment with `high` set to a new value.
+    pub(crate) fn with_high(&self, high: Id) -> Result<Self> {
+        let span = self.span()?;
+        if high.group() != span.high.group() || high < span.low {
+            return programming(format!(
+                "with_high got invalid input (segment: {:?} new_high: {:?})",
+                self, high,
+            ));
+        }
+        let parents = self.parents()?;
+        let seg = Self::new(self.flags()?, self.level()?, span.low, high, &parents);
+        Ok(seg)
+    }
+
     pub(crate) fn new(
         flags: SegmentFlags,
         level: Level,
@@ -132,6 +188,7 @@ impl Segment {
         parents: &[Id],
     ) -> Self {
         debug_assert!(high >= low);
+        debug_assert!(parents.iter().all(|&p| p < low));
         let mut buf = Vec::with_capacity(1 + 8 + (parents.len() + 2) * 4);
         buf.write_u8(flags.bits()).unwrap();
         buf.write_u8(level).unwrap();
@@ -162,27 +219,94 @@ impl Debug for Segment {
         }
         let parents = self.parents().unwrap();
         write!(f, "{}-{}{:?}", span.low, span.high, parents,)?;
+        if span.low > span.high {
+            write!(f, " (Invalid Span!!)")?;
+        }
+        if parents.iter().any(|&p| p >= span.low) {
+            write!(f, " (Invalid Parent!!)")?;
+        }
         Ok(())
     }
 }
 
+impl Debug for IdSegment {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(
+            f,
+            "L{} {}..={} {:?}{}",
+            self.level,
+            self.low,
+            self.high,
+            &self.parents,
+            if self.has_root { "R" } else { "" }
+        )
+    }
+}
+
+/// Describe bytes of a Segment.
+/// This is only for troubleshooting purpose.
+pub fn describe_segment_bytes(data: &[u8]) -> String {
+    let mut message = String::new();
+    let mut cur = Cursor::new(data);
+    let mut start = 0;
+    let mut explain = |cur: &Cursor<_>, m: String| {
+        let end = cur.position() as usize;
+        message += &format!("# {}: {}\n", hex(&data[start..end]), m);
+        start = end;
+    };
+    if let Ok(flags) = cur.read_u8() {
+        let flags = SegmentFlags::from_bits_truncate(flags);
+        explain(&cur, format!("Flags = {:?}", flags));
+    }
+    if let Ok(lv) = cur.read_u8() {
+        explain(&cur, format!("Level = {:?}", lv));
+    }
+    if let Ok(head) = cur.read_u64::<BigEndian>() {
+        explain(&cur, format!("High = {}", Id(head)));
+        if let Ok(delta) = VLQDecode::<u64>::read_vlq(&mut cur) {
+            let low = head - delta;
+            explain(&cur, format!("Delta = {} (Low = {})", delta, Id(low)));
+        }
+    }
+    if let Ok(count) = VLQDecode::<usize>::read_vlq(&mut cur) {
+        explain(&cur, format!("Parent count = {}", count));
+        for i in 0..count {
+            if let Ok(p) = VLQDecode::<u64>::read_vlq(&mut cur) {
+                explain(&cur, format!("Parents[{}] = {}", i, Id(p)));
+            }
+        }
+    }
+    message
+}
+
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .cloned()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
     use quickcheck::quickcheck;
+
+    use super::*;
 
     #[test]
     fn test_segment_roundtrip() {
-        fn prop(has_root: bool, level: Level, low: u64, delta: u64, parents: Vec<u64>) -> bool {
+        fn prop(has_root: bool, level: Level, range1: u64, range2: u64, parents: Vec<u64>) -> bool {
             let flags = if has_root {
                 SegmentFlags::HAS_ROOT
             } else {
                 SegmentFlags::empty()
             };
-            let high = low + delta;
+            let low = u64::min(range1, range2);
+            let high = u64::max(range1, range2);
+            let parents: Vec<Id> = parents.into_iter().filter(|&p| p < low).map(Id).collect();
             let low = Id(low);
             let high = Id(high);
-            let parents: Vec<Id> = parents.into_iter().map(Id).collect();
             let node = Segment::new(flags, level, low, high, &parents);
             node.flags().unwrap() == flags
                 && node.level().unwrap() == level
@@ -190,5 +314,34 @@ mod tests {
                 && node.parents().unwrap() == parents
         }
         quickcheck(prop as fn(bool, Level, u64, u64, Vec<u64>) -> bool);
+    }
+
+    #[test]
+    fn test_describe() {
+        let seg = Segment::new(
+            SegmentFlags::ONLY_HEAD,
+            3,
+            Id(101),
+            Id(202),
+            &[Id(90), Id(80)],
+        );
+        assert_eq!(
+            describe_segment_bytes(&seg.0),
+            r#"# 02: Flags = ONLY_HEAD
+# 03: Level = 3
+# 00 00 00 00 00 00 00 ca: High = 202
+# 65: Delta = 101 (Low = 101)
+# 02: Parent count = 2
+# 5a: Parents[0] = 90
+# 50: Parents[1] = 80
+"#
+        );
+    }
+
+    #[test]
+    fn test_invalid_fmt() {
+        let bytes = Bytes::from_static(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 1, 10]);
+        let segment = Segment(bytes);
+        assert_eq!(format!("{:?}", segment), "10-10[10] (Invalid Parent!!)");
     }
 }

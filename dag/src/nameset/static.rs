@@ -1,17 +1,21 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
-use super::hints::Flags;
-use super::{Hints, NameIter, NameSetQuery};
-use crate::Result;
-use crate::VertexName;
-use indexmap::IndexSet;
 use std::any::Any;
 use std::fmt;
+
+use indexmap::IndexSet;
+
+use super::hints::Flags;
+use super::AsyncNameSetQuery;
+use super::BoxVertexStream;
+use super::Hints;
+use crate::Result;
+use crate::VertexName;
 
 /// A set backed by a concrete ordered set.
 pub struct StaticSet(pub(crate) IndexSet<VertexName>, Hints);
@@ -34,27 +38,32 @@ impl StaticSet {
     }
 }
 
-impl NameSetQuery for StaticSet {
-    fn iter(&self) -> Result<Box<dyn NameIter>> {
+#[async_trait::async_trait]
+impl AsyncNameSetQuery for StaticSet {
+    async fn iter(&self) -> Result<BoxVertexStream> {
         let iter = self.0.clone().into_iter().map(Ok);
-        Ok(Box::new(iter))
+        Ok(Box::pin(futures::stream::iter(iter)))
     }
 
-    fn iter_rev(&self) -> Result<Box<dyn NameIter>> {
+    async fn iter_rev(&self) -> Result<BoxVertexStream> {
         let iter = self.0.clone().into_iter().rev().map(Ok);
-        Ok(Box::new(iter))
+        Ok(Box::pin(futures::stream::iter(iter)))
     }
 
-    fn count(&self) -> Result<usize> {
+    async fn count(&self) -> Result<usize> {
         Ok(self.0.len())
     }
 
-    fn is_empty(&self) -> Result<bool> {
+    async fn is_empty(&self) -> Result<bool> {
         Ok(self.0.is_empty())
     }
 
-    fn contains(&self, name: &VertexName) -> Result<bool> {
+    async fn contains(&self, name: &VertexName) -> Result<bool> {
         Ok(self.0.contains(name))
+    }
+
+    async fn contains_fast(&self, name: &VertexName) -> Result<Option<bool>> {
+        Ok(Some(self.0.contains(name)))
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -89,9 +98,10 @@ impl fmt::Debug for StaticSet {
 #[cfg(not(fbcode_build))]
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::super::tests::*;
     use super::*;
-    use std::collections::HashSet;
 
     fn static_set(a: &[u8]) -> StaticSet {
         StaticSet::from_names(a.iter().map(|&b| to_name(b)))
@@ -101,12 +111,15 @@ mod tests {
     fn test_static_basic() -> Result<()> {
         let set = static_set(b"\x11\x33\x22\x77\x22\x55\x11");
         check_invariants(&set)?;
-        assert_eq!(shorten_iter(set.iter()), ["11", "33", "22", "77", "55"]);
-        assert_eq!(shorten_iter(set.iter_rev()), ["55", "77", "22", "33", "11"]);
-        assert!(!set.is_empty()?);
-        assert_eq!(set.count()?, 5);
-        assert_eq!(shorten_name(set.first()?.unwrap()), "11");
-        assert_eq!(shorten_name(set.last()?.unwrap()), "55");
+        assert_eq!(shorten_iter(ni(set.iter())), ["11", "33", "22", "77", "55"]);
+        assert_eq!(
+            shorten_iter(ni(set.iter_rev())),
+            ["55", "77", "22", "33", "11"]
+        );
+        assert!(!nb(set.is_empty())?);
+        assert_eq!(nb(set.count())?, 5);
+        assert_eq!(shorten_name(nb(set.first())?.unwrap()), "11");
+        assert_eq!(shorten_name(nb(set.last())?.unwrap()), "55");
         Ok(())
     }
 
@@ -140,7 +153,7 @@ mod tests {
             let set = static_set(&a);
             check_invariants(&set).unwrap();
 
-            let count = set.count().unwrap();
+            let count = nb(set.count()).unwrap();
             assert!(count <= a.len());
 
             let set2: HashSet<_> = a.iter().cloned().collect();

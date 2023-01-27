@@ -1,19 +1,25 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
+use std::any::Any;
+use std::cmp::Ordering;
+use std::fmt;
+
+use futures::StreamExt;
+
 use super::hints::Flags;
-use super::{Hints, NameIter, NameSet, NameSetQuery};
+use super::AsyncNameSetQuery;
+use super::BoxVertexStream;
+use super::Hints;
+use super::NameSet;
 use crate::fmt::write_debug;
 use crate::Id;
 use crate::Result;
 use crate::VertexName;
-use std::any::Any;
-use std::cmp::Ordering;
-use std::fmt;
 
 /// Intersection of 2 sets.
 ///
@@ -25,12 +31,51 @@ pub struct IntersectionSet {
 }
 
 struct Iter {
-    iter: Box<dyn NameIter>,
+    iter: BoxVertexStream,
     rhs: NameSet,
     ended: bool,
 
     /// Optional fast path for stop.
     stop_condition: Option<StopCondition>,
+}
+
+impl Iter {
+    async fn next(&mut self) -> Option<Result<VertexName>> {
+        if self.ended {
+            return None;
+        }
+        loop {
+            let result = self.iter.as_mut().next().await;
+            if let Some(Ok(ref name)) = result {
+                match self.rhs.contains(&name).await {
+                    Err(err) => break Some(Err(err)),
+                    Ok(false) => {
+                        // Check if we can stop iteration early using hints.
+                        if let Some(ref cond) = self.stop_condition {
+                            if let Some(id_convert) = self.rhs.id_convert() {
+                                if let Ok(Some(id)) = id_convert.vertex_id_optional(&name).await {
+                                    if cond.should_stop_with_id(id) {
+                                        self.ended = true;
+                                        return None;
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    Ok(true) => {}
+                }
+            }
+            break result;
+        }
+    }
+
+    fn into_stream(self) -> BoxVertexStream {
+        Box::pin(futures::stream::unfold(self, |mut state| async move {
+            let result = state.next().await;
+            result.map(|r| (r, state))
+        }))
+    }
 }
 
 struct StopCondition {
@@ -50,7 +95,7 @@ impl IntersectionSet {
         let (lhs, rhs) = if lhs.hints().contains(Flags::FULL)
             && !rhs.hints().contains(Flags::FULL)
             && !rhs.hints().contains(Flags::FILTER)
-            && lhs.hints().is_dag_compatible(rhs.hints())
+            && lhs.hints().dag_version() >= rhs.hints().dag_version()
         {
             (rhs, lhs)
         } else {
@@ -67,35 +112,47 @@ impl IntersectionSet {
                     | Flags::FILTER),
         );
         // Only keep the ANCESTORS flag if lhs and rhs use a compatible Dag.
-        if lhs.hints().is_dag_compatible(rhs.hints()) {
+        if lhs.hints().dag_version() >= rhs.hints().dag_version() {
             hints.add_flags(lhs.hints().flags() & rhs.hints().flags() & Flags::ANCESTORS);
         }
-        let compatible = hints.is_id_map_compatible(rhs.hints());
-        match (lhs.hints().min_id(), rhs.hints().min_id(), compatible) {
-            (Some(id), None, _) | (Some(id), Some(_), false) | (None, Some(id), true) => {
+        let (rhs_min_id, rhs_max_id) = if hints.id_map_version() >= rhs.hints().id_map_version() {
+            // rhs ids are all known by lhs.
+            (rhs.hints().min_id(), rhs.hints().max_id())
+        } else {
+            (None, None)
+        };
+        match (lhs.hints().min_id(), rhs_min_id) {
+            (Some(id), None) | (None, Some(id)) => {
                 hints.set_min_id(id);
             }
-            (Some(id1), Some(id2), true) => {
+            (Some(id1), Some(id2)) => {
                 hints.set_min_id(id1.max(id2));
             }
-            (None, Some(_), false) | (None, None, _) => (),
+            (None, None) => {}
         }
-        match (lhs.hints().max_id(), rhs.hints().max_id(), compatible) {
-            (Some(id), None, _) | (Some(id), Some(_), false) | (None, Some(id), true) => {
+        match (lhs.hints().max_id(), rhs_max_id) {
+            (Some(id), None) | (None, Some(id)) => {
                 hints.set_max_id(id);
             }
-            (Some(id1), Some(id2), true) => {
+            (Some(id1), Some(id2)) => {
                 hints.set_max_id(id1.min(id2));
             }
-            (None, Some(_), false) | (None, None, _) => (),
+            (None, None) => {}
         }
         Self { lhs, rhs, hints }
     }
+
+    fn is_rhs_id_map_comapatible(&self) -> bool {
+        let lhs_version = self.lhs.hints().id_map_version();
+        let rhs_version = self.rhs.hints().id_map_version();
+        lhs_version == rhs_version || (lhs_version > rhs_version && rhs_version > None)
+    }
 }
 
-impl NameSetQuery for IntersectionSet {
-    fn iter(&self) -> Result<Box<dyn NameIter>> {
-        let stop_condition = if !self.lhs.hints().is_id_map_compatible(self.rhs.hints()) {
+#[async_trait::async_trait]
+impl AsyncNameSetQuery for IntersectionSet {
+    async fn iter(&self) -> Result<BoxVertexStream> {
+        let stop_condition = if !self.is_rhs_id_map_comapatible() {
             None
         } else if self.lhs.hints().contains(Flags::ID_ASC) {
             if let Some(id) = self.rhs.hints().max_id() {
@@ -120,16 +177,16 @@ impl NameSetQuery for IntersectionSet {
         };
 
         let iter = Iter {
-            iter: self.lhs.iter()?,
+            iter: self.lhs.iter().await?,
             rhs: self.rhs.clone(),
             ended: false,
             stop_condition,
         };
-        Ok(Box::new(iter))
+        Ok(iter.into_stream())
     }
 
-    fn iter_rev(&self) -> Result<Box<dyn NameIter>> {
-        let stop_condition = if !self.lhs.hints().is_id_map_compatible(self.rhs.hints()) {
+    async fn iter_rev(&self) -> Result<BoxVertexStream> {
+        let stop_condition = if !self.is_rhs_id_map_comapatible() {
             None
         } else if self.lhs.hints().contains(Flags::ID_DESC) {
             if let Some(id) = self.rhs.hints().max_id() {
@@ -154,16 +211,27 @@ impl NameSetQuery for IntersectionSet {
         };
 
         let iter = Iter {
-            iter: self.lhs.iter_rev()?,
+            iter: self.lhs.iter_rev().await?,
             rhs: self.rhs.clone(),
             ended: false,
             stop_condition,
         };
-        Ok(Box::new(iter))
+        Ok(iter.into_stream())
     }
 
-    fn contains(&self, name: &VertexName) -> Result<bool> {
-        Ok(self.lhs.contains(name)? && self.rhs.contains(name)?)
+    async fn contains(&self, name: &VertexName) -> Result<bool> {
+        Ok(self.lhs.contains(name).await? && self.rhs.contains(name).await?)
+    }
+
+    async fn contains_fast(&self, name: &VertexName) -> Result<Option<bool>> {
+        for set in &[&self.lhs, &self.rhs] {
+            let contains = set.contains_fast(name).await?;
+            match contains {
+                Some(false) | None => return Ok(contains),
+                Some(true) => {}
+            }
+        }
+        Ok(Some(true))
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -184,49 +252,16 @@ impl fmt::Debug for IntersectionSet {
     }
 }
 
-impl Iterator for Iter {
-    type Item = Result<VertexName>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.ended {
-            return None;
-        }
-        loop {
-            let result = NameIter::next(self.iter.as_mut());
-            if let Some(Ok(ref name)) = result {
-                match self.rhs.contains(&name) {
-                    Err(err) => break Some(Err(err)),
-                    Ok(false) => {
-                        // Check if we can stop iteration early using hints.
-                        if let Some(ref cond) = self.stop_condition {
-                            if let Some(id_convert) = self.rhs.id_convert() {
-                                if let Ok(Some(id)) = id_convert.vertex_id_optional(&name) {
-                                    if cond.should_stop_with_id(id) {
-                                        self.ended = true;
-                                        return None;
-                                    }
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    Ok(true) => (),
-                }
-            }
-            break result;
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::redundant_clone)]
 mod tests {
-    use super::super::id_lazy::tests::lazy_set;
-    use super::super::id_lazy::tests::lazy_set_inherit;
+    use std::collections::HashSet;
+
+    use super::super::id_lazy::test_utils::lazy_set;
+    use super::super::id_lazy::test_utils::lazy_set_inherit;
     use super::super::tests::*;
     use super::*;
     use crate::Id;
-    use std::collections::HashSet;
 
     fn intersection(a: &[u8], b: &[u8]) -> IntersectionSet {
         let a = NameSet::from_query(VecQuery::from_bytes(a));
@@ -238,14 +273,14 @@ mod tests {
     fn test_intersection_basic() -> Result<()> {
         let set = intersection(b"\x11\x33\x55\x22\x44", b"\x44\x33\x66");
         check_invariants(&set)?;
-        assert_eq!(shorten_iter(set.iter()), ["33", "44"]);
-        assert_eq!(shorten_iter(set.iter_rev()), ["44", "33"]);
-        assert!(!set.is_empty()?);
-        assert_eq!(set.count()?, 2);
-        assert_eq!(shorten_name(set.first()?.unwrap()), "33");
-        assert_eq!(shorten_name(set.last()?.unwrap()), "44");
+        assert_eq!(shorten_iter(ni(set.iter())), ["33", "44"]);
+        assert_eq!(shorten_iter(ni(set.iter_rev())), ["44", "33"]);
+        assert!(!nb(set.is_empty())?);
+        assert_eq!(nb(set.count())?, 2);
+        assert_eq!(shorten_name(nb(set.first())?.unwrap()), "33");
+        assert_eq!(shorten_name(nb(set.last())?.unwrap()), "44");
         for &b in b"\x11\x22\x55\x66".iter() {
-            assert!(!set.contains(&to_name(b))?);
+            assert!(!nb(set.contains(&to_name(b)))?);
         }
         Ok(())
     }
@@ -263,9 +298,9 @@ mod tests {
 
         let set = IntersectionSet::new(a, b.clone());
         // No "20" - filtered out by min id fast path.
-        assert_eq!(shorten_iter(set.iter()), ["70", "50", "40"]);
+        assert_eq!(shorten_iter(ni(set.iter())), ["70", "50", "40"]);
         // No "70" - filtered out by max id fast path.
-        assert_eq!(shorten_iter(set.iter_rev()), ["20", "40", "50"]);
+        assert_eq!(shorten_iter(ni(set.iter_rev())), ["20", "40", "50"]);
 
         // Test the reversed sort order.
         let a = lazy_set(&[0x20, 0x30, 0x40, 0x50, 0x60, 0x70]);
@@ -277,17 +312,17 @@ mod tests {
         b.hints().set_max_id(Id(0x50));
         let set = IntersectionSet::new(a, b.clone());
         // No "70".
-        assert_eq!(shorten_iter(set.iter()), ["20", "40", "50"]);
+        assert_eq!(shorten_iter(ni(set.iter())), ["20", "40", "50"]);
         // No "20".
-        assert_eq!(shorten_iter(set.iter_rev()), ["70", "50", "40"]);
+        assert_eq!(shorten_iter(ni(set.iter_rev())), ["70", "50", "40"]);
 
         // If two sets have incompatible IdMap, fast paths are not used.
         let a = NameSet::from_query(lazy_set(&[0x20, 0x30, 0x40, 0x50, 0x60, 0x70]));
         a.hints().add_flags(Flags::ID_ASC);
         let set = IntersectionSet::new(a, b.clone());
         // Should contain "70" and "20".
-        assert_eq!(shorten_iter(set.iter()), ["20", "40", "50", "70"]);
-        assert_eq!(shorten_iter(set.iter_rev()), ["70", "50", "40", "20"]);
+        assert_eq!(shorten_iter(ni(set.iter())), ["20", "40", "50", "70"]);
+        assert_eq!(shorten_iter(ni(set.iter_rev())), ["70", "50", "40", "20"]);
     }
 
     quickcheck::quickcheck! {
@@ -295,12 +330,12 @@ mod tests {
             let set = intersection(&a, &b);
             check_invariants(&set).unwrap();
 
-            let count = set.count().unwrap();
+            let count = nb(set.count()).unwrap();
             assert!(count <= a.len(), "len({:?}) = {} should <= len({:?})" , &set, count, &a);
             assert!(count <= b.len(), "len({:?}) = {} should <= len({:?})" , &set, count, &b);
 
-            let contains_a: HashSet<u8> = a.into_iter().filter(|&b| set.contains(&to_name(b)).ok() == Some(true)).collect();
-            let contains_b: HashSet<u8> = b.into_iter().filter(|&b| set.contains(&to_name(b)).ok() == Some(true)).collect();
+            let contains_a: HashSet<u8> = a.into_iter().filter(|&b| nb(set.contains(&to_name(b))).ok() == Some(true)).collect();
+            let contains_b: HashSet<u8> = b.into_iter().filter(|&b| nb(set.contains(&to_name(b))).ok() == Some(true)).collect();
             assert_eq!(contains_a, contains_b);
 
             true
